@@ -5,6 +5,8 @@ const API_BASE = 'http://localhost:3001';
 
 function CreateSecret() {
   const [text, setText] = useState('');
+  const [expiresInSeconds, setExpiresInSeconds] = useState(3600);
+  const [burnAfterRead, setBurnAfterRead] = useState(false);
   const [link, setLink] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -26,7 +28,7 @@ function CreateSecret() {
       const response = await fetch(`${API_BASE}/pastes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ciphertext, iv }),
+        body: JSON.stringify({ ciphertext, iv, expiresInSeconds, burnAfterRead }),
       });
 
       if (!response.ok) {
@@ -58,6 +60,32 @@ function CreateSecret() {
             cols={50}
           />
         </div>
+
+        <div style={{ margin: '1rem 0' }}>
+          <label>
+            Expiry:{' '}
+            <select
+              value={expiresInSeconds}
+              onChange={(e) => setExpiresInSeconds(Number(e.target.value))}
+            >
+              <option value={300}>5 minutes</option>
+              <option value={3600}>1 hour</option>
+              <option value={86400}>1 day</option>
+            </select>
+          </label>
+        </div>
+
+        <div style={{ margin: '1rem 0' }}>
+          <label>
+            <input
+              type="checkbox"
+              checked={burnAfterRead}
+              onChange={(e) => setBurnAfterRead(e.target.checked)}
+            />{' '}
+            Burn after read
+          </label>
+        </div>
+
         <button type="submit" disabled={submitting}>
           {submitting ? 'Encrypting...' : 'Create Secret'}
         </button>

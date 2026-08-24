@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { decryptContent } from './crypto.js';
 
 const API_BASE = 'http://localhost:3001';
@@ -30,16 +30,18 @@ function parseViewHash(hash) {
 function ViewSecret() {
   const [status, setStatus] = useState('loading'); // loading | success | error
   const [plaintext, setPlaintext] = useState('');
+  const hasFetchedRef = useRef(false);
 
   useEffect(() => {
+    if (hasFetchedRef.current) return;
+    hasFetchedRef.current = true;
+
     const { id, key } = parseViewHash(window.location.hash);
 
     if (!id || !key) {
       setStatus('error');
       return;
     }
-
-    let cancelled = false;
 
     async function fetchAndDecrypt() {
       try {
@@ -52,29 +54,24 @@ function ViewSecret() {
         const { ciphertext, iv } = await response.json();
         const decrypted = await decryptContent(ciphertext, iv, key);
 
-        if (!cancelled) {
-          setPlaintext(decrypted);
-          setStatus('success');
-        }
+        setPlaintext(decrypted);
+        setStatus('success');
       } catch (err) {
-        if (!cancelled) {
-          setStatus('error');
-        }
+        setStatus('error');
       }
     }
 
     fetchAndDecrypt();
 
-    return () => {
-      cancelled = true;
-    };
+    // No cleanup/cancellation needed: hasFetchedRef already guarantees this only
+    // runs once per real mount, which is all that matters for a one-shot view page.
   }, []);
 
   return (
     <main>
       <h1>Secured_Gossip</h1>
       {status === 'loading' && <p>Decrypting...</p>}
-      {status === 'error' && <p>invalid or expired link</p>}
+      {status === 'error' && <p>This secret has expired or already been viewed</p>}
       {status === 'success' && (
         <pre style={{ whiteSpace: 'pre-wrap', textAlign: 'left' }}>{plaintext}</pre>
       )}
