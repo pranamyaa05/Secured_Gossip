@@ -6,27 +6,26 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // ---- Config ----
-const PIN_ITERATIONS = 300000; // PBKDF2 iterations for the server-side PIN verifier
-const PIN_KEYLEN = 32; // bytes
+const PIN_ITERATIONS = 300000;
+const PIN_KEYLEN = 32;
 const PIN_DIGEST = 'sha256';
-const MAX_PIN_ATTEMPTS = 5; // wrong PIN attempts before the secret is destroyed
+const MAX_PIN_ATTEMPTS = 5;
 const REVEAL_RATE_LIMIT_WINDOW_MS = 60 * 1000;
-const REVEAL_RATE_LIMIT_MAX = 30; // requests per IP per window, across all pastes
+const REVEAL_RATE_LIMIT_MAX = 30;
 
-// In-memory store for pastes: id -> {
-//   ciphertext, iv, createdAt, expiresInSeconds, burnAfterRead,
-//   hasPin, pinHash, pinSalt, pinAttempts, contentSalt,
-//   deleteTokenHash
-// }
-// No persistence, no accounts. The PIN itself is NEVER stored (only a salted
-// PBKDF2 hash of it) and is NEVER written to any log line.
+// In-memory store for ciphertext and crypto parameters.
 const pastes = new Map();
+
+// In-memory store for creator status tracking. 
+// Separated from 'pastes' so burn-after-read can delete ciphertext 
+// while leaving behind non-sensitive status metadata for the creator.
+// id -> { deleteTokenHash, status, createdAt, expiresInSeconds, viewedAt }
+const pasteStatus = new Map();
 
 app.use(cors());
 app.use(express.json());
 
-// ---- tiny in-memory IP rate limiter for the reveal endpoint ----
-const revealHits = new Map(); // ip -> { count, resetAt }
+const revealHits = new Map();
 function isRateLimited(ip) {
   const now = Date.now();
   const entry = revealHits.get(ip);
@@ -38,14 +37,11 @@ function isRateLimited(ip) {
   return entry.count > REVEAL_RATE_LIMIT_MAX;
 }
 
-function isExpired(paste) {
-  return Date.now() > paste.createdAt + paste.expiresInSeconds * 1000;
+function isExpired(pasteOrMeta) {
+  return Date.now() > pasteOrMeta.createdAt + pasteOrMeta.expiresInSeconds * 1000;
 }
 
 function hashPin(pin, salt) {
-  // Synchronous on purpose: it keeps the whole /reveal handler synchronous
-  // (see comment in the route below) so burn-after-read deletion is atomic
-  // with respect to concurrent requests, with no extra locking needed.
   return crypto.pbkdf2Sync(pin, salt, PIN_ITERATIONS, PIN_KEYLEN, PIN_DIGEST);
 }
 
@@ -85,11 +81,11 @@ app.post('/pastes', (req, res) => {
     hasPin = true;
     pinSalt = crypto.randomBytes(16);
     pinHash = hashPin(pin, pinSalt);
-    // `pin` is not referenced again below and is never logged or persisted.
   }
 
   const id = crypto.randomUUID();
   const deleteToken = crypto.randomBytes(24).toString('base64url');
+  const deleteTokenHash = sha256Hex(deleteToken);
 
   pastes.set(id, {
     ciphertext,
@@ -102,30 +98,67 @@ app.post('/pastes', (req, res) => {
     pinSalt,
     pinAttempts: 0,
     contentSalt: hasPin ? contentSalt : null,
-    deleteTokenHash: sha256Hex(deleteToken),
+    deleteTokenHash,
   });
 
-  // deleteToken is handed back exactly once, to the creator only.
+  pasteStatus.set(id, {
+    deleteTokenHash,
+    status: 'waiting', // waiting | seen | revoked | expired | destroyed
+    createdAt: Date.now(),
+    expiresInSeconds: Number(expiresInSeconds),
+    viewedAt: null
+  });
+
   res.status(201).json({ id, deleteToken });
 });
 
-// Lightweight metadata check. Safe for automated link scanners / preview bots:
-// it never returns ciphertext and never consumes burn-after-read or a PIN attempt.
+// Creator-authorized endpoint to check the status of a secret without consuming it.
+app.get('/pastes/:id/status', (req, res) => {
+  const { id } = req.params;
+  const token = req.get('x-delete-token');
+  const meta = pasteStatus.get(id);
+
+  if (!meta) {
+    return res.status(404).json({ error: 'not found' });
+  }
+
+  if (typeof token !== 'string' || !token) {
+    return res.status(400).json({ error: 'delete token required' });
+  }
+
+  const candidateHash = Buffer.from(sha256Hex(token), 'hex');
+  const storedHash = Buffer.from(meta.deleteTokenHash, 'hex');
+  
+  if (candidateHash.length !== storedHash.length || !crypto.timingSafeEqual(candidateHash, storedHash)) {
+    return res.status(403).json({ error: 'invalid delete token' });
+  }
+
+  // Dynamically mark as expired if queried after time is up
+  if (meta.status === 'waiting' && isExpired(meta)) {
+    meta.status = 'expired';
+    pastes.delete(id); // Ensure ciphertext is aggressively wiped
+  }
+
+  res.json({
+    status: meta.status,
+    viewedAt: meta.viewedAt
+  });
+});
+
 app.get('/pastes/:id/meta', (req, res) => {
   const { id } = req.params;
   const paste = pastes.get(id);
+  const meta = pasteStatus.get(id);
 
   if (!paste || isExpired(paste)) {
     if (paste) pastes.delete(id);
+    if (meta && meta.status === 'waiting') meta.status = 'expired';
     return res.status(404).json({ error: 'not found' });
   }
 
   res.json({ hasPin: paste.hasPin });
 });
 
-// Explicit reveal action. This is the ONLY endpoint that returns ciphertext.
-// The frontend calls it solely in response to the user clicking "Reveal
-// Secret" (and, for PIN-protected secrets, only after submitting a PIN).
 app.post('/pastes/:id/reveal', (req, res) => {
   if (isRateLimited(req.ip)) {
     return res.status(429).json({ error: 'too many requests, slow down' });
@@ -134,9 +167,11 @@ app.post('/pastes/:id/reveal', (req, res) => {
   const { id } = req.params;
   const { pin } = req.body || {};
   const paste = pastes.get(id);
+  const meta = pasteStatus.get(id);
 
   if (!paste || isExpired(paste)) {
     if (paste) pastes.delete(id);
+    if (meta && meta.status === 'waiting') meta.status = 'expired';
     return res.status(404).json({ error: 'not found' });
   }
 
@@ -153,8 +188,8 @@ app.post('/pastes/:id/reveal', (req, res) => {
     if (!correct) {
       paste.pinAttempts += 1;
       if (paste.pinAttempts >= MAX_PIN_ATTEMPTS) {
-        // Destroy the secret outright so it can't keep being brute-forced.
         pastes.delete(id);
+        if (meta) meta.status = 'destroyed';
         return res.status(429).json({ error: 'too many incorrect PIN attempts, secret deleted' });
       }
       return res.status(401).json({
@@ -164,14 +199,14 @@ app.post('/pastes/:id/reveal', (req, res) => {
     }
   }
 
-  // Everything above is synchronous (pbkdf2Sync + Map lookups), so this
-  // handler runs to completion without ever yielding to the event loop.
-  // That makes the delete below atomic w.r.t. concurrent/parallel requests
-  // for the same id: two simultaneous reveals of a burn-after-read secret
-  // cannot both succeed, because Node can't interleave two synchronous
-  // handlers mid-execution.
   const payload = { ciphertext: paste.ciphertext, iv: paste.iv };
   if (paste.hasPin) payload.contentSalt = paste.contentSalt;
+
+  // Mark as seen *before* potential burn-after-read deletion
+  if (meta) {
+    meta.status = 'seen';
+    meta.viewedAt = Date.now();
+  }
 
   if (paste.burnAfterRead) {
     pastes.delete(id);
@@ -182,14 +217,12 @@ app.post('/pastes/:id/reveal', (req, res) => {
   res.json(payload);
 });
 
-// Creator-only revocation: requires the random delete token that was
-// returned exactly once at creation time. Only a hash of it is ever stored.
 app.delete('/pastes/:id', (req, res) => {
   const { id } = req.params;
   const token = req.get('x-delete-token') || (req.body && req.body.deleteToken);
-  const paste = pastes.get(id);
+  const meta = pasteStatus.get(id);
 
-  if (!paste) {
+  if (!meta) {
     return res.status(404).json({ error: 'not found' });
   }
 
@@ -198,7 +231,7 @@ app.delete('/pastes/:id', (req, res) => {
   }
 
   const candidateHash = Buffer.from(sha256Hex(token), 'hex');
-  const storedHash = Buffer.from(paste.deleteTokenHash, 'hex');
+  const storedHash = Buffer.from(meta.deleteTokenHash, 'hex');
   const match =
     candidateHash.length === storedHash.length &&
     crypto.timingSafeEqual(candidateHash, storedHash);
@@ -207,19 +240,38 @@ app.delete('/pastes/:id', (req, res) => {
     return res.status(403).json({ error: 'invalid delete token' });
   }
 
-  pastes.delete(id);
+  if (pastes.has(id)) {
+    pastes.delete(id);
+  }
+
+  if (meta.status === 'waiting') {
+    meta.status = 'revoked';
+  }
+
   res.status(204).end();
 });
 
-// Periodically clean up expired pastes
 setInterval(() => {
   const now = Date.now();
+  
+  // 1. Wipe expired ciphertext
   for (const [id, paste] of pastes.entries()) {
     if (now > paste.createdAt + paste.expiresInSeconds * 1000) {
       pastes.delete(id);
+      const meta = pasteStatus.get(id);
+      if (meta && meta.status === 'waiting') {
+        meta.status = 'expired';
+      }
     }
   }
-}, 60000); // Every 60 seconds
+
+  // 2. Clean up old metadata (keep for 24 hours after expiration so creator can still check status)
+  for (const [id, meta] of pasteStatus.entries()) {
+    if (now > meta.createdAt + meta.expiresInSeconds * 1000 + (24 * 60 * 60 * 1000)) {
+      pasteStatus.delete(id);
+    }
+  }
+}, 60000);
 
 app.listen(PORT, () => {
   console.log(`Secured_Gossip backend listening on port ${PORT}`);
