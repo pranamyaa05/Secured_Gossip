@@ -1,10 +1,10 @@
+import CreateSecret from './CreateSecret.jsx';
+import ViewSecret from './ViewSecret.jsx';
+
 function App() {
-  return (
-    <main>
-      <h1>Secured_Gossip</h1>
-      <p>Project scaffolding is ready.</p>
-    </main>
-  );
+  const isViewRoute = window.location.hash.startsWith('#/view/');
+
+  return isViewRoute ? <ViewSecret /> : <CreateSecret />;
 }
 
 export default App;
