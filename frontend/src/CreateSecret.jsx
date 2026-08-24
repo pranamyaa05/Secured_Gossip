@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { encryptContent } from './crypto.js';
+import { encryptContent, encryptContentWithPin } from './crypto.js';
 
 const API_BASE = 'http://localhost:3001';
 
@@ -7,6 +7,8 @@ function CreateSecret() {
   const [text, setText] = useState('');
   const [expiresInSeconds, setExpiresInSeconds] = useState(3600);
   const [burnAfterRead, setBurnAfterRead] = useState(false);
+  const [enablePin, setEnablePin] = useState(false);
+  const [pin, setPin] = useState('');
   const [link, setLink] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -21,14 +23,30 @@ function CreateSecret() {
       return;
     }
 
+    if (enablePin && (pin.length < 4 || pin.length > 32)) {
+      setError('PIN must be between 4 and 32 characters.');
+      return;
+    }
+
     setSubmitting(true);
     try {
-      const { ciphertext, iv, key } = await encryptContent(text);
+      let payload;
+      let urlFragmentKey;
+
+      if (enablePin) {
+        const { ciphertext, iv, fragmentKey, salt } = await encryptContentWithPin(text, pin);
+        payload = { ciphertext, iv, expiresInSeconds, burnAfterRead, pin, contentSalt: salt };
+        urlFragmentKey = fragmentKey;
+      } else {
+        const { ciphertext, iv, key } = await encryptContent(text);
+        payload = { ciphertext, iv, expiresInSeconds, burnAfterRead };
+        urlFragmentKey = key;
+      }
 
       const response = await fetch(`${API_BASE}/pastes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ciphertext, iv, expiresInSeconds, burnAfterRead }),
+        body: JSON.stringify(payload),
       });
 
       if (!response.ok) {
@@ -37,9 +55,11 @@ function CreateSecret() {
 
       const { id } = await response.json();
 
-      const url = `${window.location.origin}/#/view/${id}#${key}`;
+      const url = `${window.location.origin}/#/view/${id}#${urlFragmentKey}`;
       setLink(url);
       setText('');
+      setPin(''); // Immediately clear the PIN from state
+      setEnablePin(false);
     } catch (err) {
       setError('Failed to create secret. Please try again.');
     } finally {
@@ -85,6 +105,33 @@ function CreateSecret() {
             Burn after read
           </label>
         </div>
+
+        <div style={{ margin: '1rem 0' }}>
+          <label>
+            <input
+              type="checkbox"
+              checked={enablePin}
+              onChange={(e) => setEnablePin(e.target.checked)}
+            />{' '}
+            Require a PIN to unlock
+          </label>
+        </div>
+
+        {enablePin && (
+          <div style={{ margin: '1rem 0' }}>
+            <label>
+              PIN:{' '}
+              <input
+                type="password"
+                value={pin}
+                onChange={(e) => setPin(e.target.value)}
+                placeholder="4-32 characters"
+                minLength={4}
+                maxLength={32}
+              />
+            </label>
+          </div>
+        )}
 
         <button type="submit" disabled={submitting}>
           {submitting ? 'Encrypting...' : 'Create Secret'}

@@ -6,6 +6,11 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+// PBKDF2 iteration count used to derive a content key from (fragment key + PIN).
+// Must match the server's PIN verifier iteration count in spirit (they are
+// independent derivations with independent salts, but both should be slow).
+export const PBKDF2_ITERATIONS = 300000;
+
 /**
  * Convert a base64url string to an ArrayBuffer.
  * Reverses the URL-safe encoding: '-' -> '+', '_' -> '/', padding restored.
@@ -103,6 +108,7 @@ export async function decrypt(key, base64Ciphertext, base64Iv) {
 
 /**
  * Encrypt string content with a fresh random 256-bit AES-GCM key.
+ * (Unchanged, non-PIN flow: the key lives only in the URL fragment.)
  * @param {string} plaintext - content to encrypt
  * @returns {Promise<{ciphertext: string, iv: string, key: string}>}
  *          ciphertext, iv, key are base64-encoded.
@@ -134,5 +140,105 @@ export async function encryptContent(plaintext) {
  */
 export async function decryptContent(base64Ciphertext, base64Iv, base64Key) {
   const key = await importKey(base64Key);
+  return decrypt(key, base64Ciphertext, base64Iv);
+}
+
+// ---------------------------------------------------------------------------
+// PIN-protected content key derivation (Layer 1 of the PIN design).
+//
+// The content key is derived from BOTH the random URL-fragment key AND the
+// user's PIN via PBKDF2-HMAC-SHA-256 with a high iteration count. This means:
+//   - Someone with only the link (no PIN) cannot decrypt.
+//   - Someone with only the PIN (no link/fragment key) cannot decrypt.
+//   - Brute-forcing the PIN offline is slowed down by the iteration count.
+// The fragment key and PIN never leave the browser for this derivation; only
+// the (non-secret) salt is sent to the server so the recipient can repeat the
+// derivation.
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a fresh random fragment key (same shape as encryptContent's key),
+ * exposed separately so PIN mode can put it in the URL fragment *before*
+ * it's combined with the PIN for key derivation.
+ */
+export function generateFragmentKey() {
+  const rawKey = crypto.getRandomValues(new Uint8Array(32));
+  return arrayBufferToBase64Url(rawKey);
+}
+
+/**
+ * Generate a fresh random salt for PBKDF2, base64url-encoded.
+ */
+export function generateSalt(byteLength = 16) {
+  const salt = crypto.getRandomValues(new Uint8Array(byteLength));
+  return arrayBufferToBase64Url(salt);
+}
+
+/**
+ * Derive an AES-256-GCM CryptoKey from (fragment key + PIN) via PBKDF2.
+ * NOT HKDF - HKDF is an extraction/expansion function and provides no
+ * work-factor against low-entropy PIN guessing. PBKDF2's iteration count is
+ * what makes offline PIN brute-forcing expensive.
+ *
+ * @param {string} fragmentKeyB64 - the random key that lives in the URL fragment
+ * @param {string} pin - the user-supplied PIN
+ * @param {string} saltB64 - base64url salt (stored alongside the ciphertext)
+ * @param {number} iterations
+ * @returns {Promise<CryptoKey>}
+ */
+export async function derivePinContentKey(
+  fragmentKeyB64,
+  pin,
+  saltB64,
+  iterations = PBKDF2_ITERATIONS
+) {
+  const keyMaterialBytes = encoder.encode(`${fragmentKeyB64}:${pin}`);
+  const baseKey = await crypto.subtle.importKey(
+    'raw',
+    keyMaterialBytes,
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+  const saltBytes = base64UrlToArrayBuffer(saltB64);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltBytes,
+      iterations,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt']
+  );
+}
+
+/**
+ * Encrypt content for the PIN-protected flow.
+ * @param {string} plaintext
+ * @param {string} pin
+ * @returns {Promise<{ciphertext: string, iv: string, fragmentKey: string, salt: string}>}
+ */
+export async function encryptContentWithPin(plaintext, pin) {
+  const fragmentKey = generateFragmentKey();
+  const salt = generateSalt();
+  const key = await derivePinContentKey(fragmentKey, pin, salt);
+  const { ciphertext, iv } = await encrypt(key, plaintext);
+  return { ciphertext, iv, fragmentKey, salt };
+}
+
+/**
+ * Decrypt content that was encrypted with encryptContentWithPin().
+ * @param {string} base64Ciphertext
+ * @param {string} base64Iv
+ * @param {string} fragmentKeyB64
+ * @param {string} pin
+ * @param {string} saltB64
+ * @returns {Promise<string>}
+ */
+export async function decryptContentWithPin(base64Ciphertext, base64Iv, fragmentKeyB64, pin, saltB64) {
+  const key = await derivePinContentKey(fragmentKeyB64, pin, saltB64);
   return decrypt(key, base64Ciphertext, base64Iv);
 }
