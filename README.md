@@ -27,7 +27,11 @@ Beyond basic zero-knowledge sharing, Secured_Gossip introduces:
 - **Status Tracking**: Creator dashboard showing secret state (waiting/seen/expired/revoked/destroyed).
 
 ## Technical Implementation & Architecture
+## Technical Implementation & Architecture
+
 ### Architecture
+
+```mermaid
 flowchart TD
     subgraph Client["Browser (Client-Side)"]
         direction TB
@@ -67,7 +71,6 @@ flowchart TD
     Crypto -.->|"Implements"| PIN
     Store -.->|"Enforces"| TA
     Store -.->|"Enforces"| BR
-
 ### Component Breakdown
 | Layer | Technology | Responsibility |
 |-------|------------|----------------|
