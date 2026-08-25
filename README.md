@@ -28,38 +28,45 @@ Beyond basic zero-knowledge sharing, Secured_Gossip introduces:
 
 ## Technical Implementation & Architecture
 ### Architecture
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#0066cc', 'secondaryColor': '#0099ff', 'tertiaryColor': '#99ccff', 'lineColor': '#333', 'fontSize': '14px'}}}%%
 flowchart TD
-    subgraph Client[Browser (Client-Side)]
+    subgraph Client["Browser (Client-Side)"]
         direction TB
-        UI[User Interface<br/>React + Vite] --> Crypto[Cryptography Layer<br/>Web Crypto API]
-        Crypto -->|Encrypted Data + Key| Network[Network Layer]
+        UI["User Interface<br/>React + Vite"]
+        Crypto["Cryptography Layer<br/>Web Crypto API"]
+        Network["Network Layer"]
+
+        UI --> Crypto
+        Crypto -->|"Encrypted Data + Key"| Network
     end
 
-    subgraph Server[Backend Server]
+    subgraph Server["Backend Server"]
         direction TB
-        API[REST API<br/>Node.js + Express] --> Store[In-Memory Store<br/>Map<id, {ciphertext, iv, metadata}>]
-        Store -->|Encrypted Data Only| DB[(Ephemeral Storage)]
+        API["REST API<br/>Node.js + Express"]
+        Store["In-Memory Store<br/>Map&lt;id, ciphertext, iv, metadata&gt;"]
+
+        API --> Store
     end
 
-    Network -->|HTTPS POST| API
-    API -->|HTTPS Response| Network
-    Network -->|Encrypted Payload| UI
+    Network -->|"HTTPS POST"| API
+    API -->|"HTTPS Response"| Network
+    Network -->|"Encrypted Payload"| UI
 
-    subgraph Security Features[Security Features]
+    subgraph Security["Security Features"]
         direction LR
-        ZK[Zero-Knowledge<br/>Server sees only ciphertext]
-        FS[Forward Secrecy<br/>Daily-rotating master secret]
-        MR[Multi-Recipient<br/>Envelope Encryption]
-        PIN[PBKDF2 PIN Protection<br/>300k iterations]
-        TA[Time-Bound Access<br/>notBefore/notAfter]
-        BR[Burn-After-Read & Revocation]
+        ZK["Zero-Knowledge<br/>Server sees only ciphertext"]
+        FS["Forward Secrecy<br/>Daily-rotating master secret"]
+        MR["Multi-Recipient<br/>Envelope Encryption"]
+        PIN["PBKDF2 PIN Protection<br/>300k iterations"]
+        TA["Time-Bound Access<br/>notBefore / notAfter"]
+        BR["Burn-After-Read & Revocation"]
     end
 
-    Crypto -->|Implements| Security Features
-    Store -->|Enforces| Security Features
-```
+    Crypto -.->|"Implements"| ZK
+    Crypto -.->|"Implements"| FS
+    Crypto -.->|"Implements"| MR
+    Crypto -.->|"Implements"| PIN
+    Store -.->|"Enforces"| TA
+    Store -.->|"Enforces"| BR
 
 ### Component Breakdown
 | Layer | Technology | Responsibility |
@@ -132,8 +139,7 @@ flowchart TD
 8. Test PIN protection with wrong/right PINs
 9. Test revocation using the delete token shown after creation
 
-## License
-MIT License - see LICENSE file for details.
+
 
 ## Acknowledgments
 - PrivateBin and ZeroBin for pioneering zero-knowledge pastebin concept
