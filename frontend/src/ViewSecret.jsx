@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { decryptContent, decryptContentWithPin } from './crypto.js';
+import { decryptContentAndAttachment, decryptContentAndAttachmentWithPin } from './crypto.js';
 
 const API_BASE = 'http://localhost:3001';
 
@@ -26,9 +26,10 @@ function parseViewHash(hash) {
 
 function ViewSecret() {
   const [status, setStatus] = useState('loading_meta'); // loading_meta | ready | revealing | success | error
-  const [metaInfo, setMetaInfo] = useState({ id: null, fragmentKey: null, hasPin: false });
+  const [metaInfo, setMetaInfo] = useState({ id: null, fragmentKey: null, hasPin: false, hasAttachment: false });
   const [pinInput, setPinInput] = useState('');
   const [plaintext, setPlaintext] = useState('');
+  const [attachment, setAttachment] = useState(null); // { filename, url } | null
   const [errorMessage, setErrorMessage] = useState('');
   const hasFetchedRef = useRef(false);
 
@@ -52,8 +53,8 @@ function ViewSecret() {
           throw new Error('not found');
         }
 
-        const { hasPin } = await response.json();
-        setMetaInfo({ id, fragmentKey: key, hasPin });
+        const { hasPin, hasAttachment } = await response.json();
+        setMetaInfo({ id, fragmentKey: key, hasPin, hasAttachment: Boolean(hasAttachment) });
         setStatus('ready');
       } catch (err) {
         setStatus('error');
@@ -63,6 +64,14 @@ function ViewSecret() {
 
     fetchMeta();
   }, []);
+
+  // Revoke the object URL for any previously-created attachment blob when it's
+  // replaced or when the component unmounts, so we don't leak memory.
+  useEffect(() => {
+    return () => {
+      if (attachment?.url) URL.revokeObjectURL(attachment.url);
+    };
+  }, [attachment]);
 
   async function handleReveal(e) {
     if (e) e.preventDefault();
@@ -94,22 +103,42 @@ function ViewSecret() {
         }
       }
 
-      const { ciphertext, iv, contentSalt } = await response.json();
-      
+      const { ciphertext, iv, contentSalt, attachmentCiphertext, attachmentIv } = await response.json();
+
       let decrypted;
       if (metaInfo.hasPin) {
-        decrypted = await decryptContentWithPin(
-          ciphertext, 
-          iv, 
-          metaInfo.fragmentKey, 
-          pinInput, 
-          contentSalt
+        decrypted = await decryptContentAndAttachmentWithPin(
+          ciphertext,
+          iv,
+          metaInfo.fragmentKey,
+          pinInput,
+          contentSalt,
+          attachmentCiphertext,
+          attachmentIv
         );
       } else {
-        decrypted = await decryptContent(ciphertext, iv, metaInfo.fragmentKey);
+        decrypted = await decryptContentAndAttachment(
+          ciphertext,
+          iv,
+          metaInfo.fragmentKey,
+          attachmentCiphertext,
+          attachmentIv
+        );
       }
 
-      setPlaintext(decrypted);
+      setPlaintext(decrypted.plaintext);
+
+      if (decrypted.attachment) {
+        const blob = new Blob(
+          [decrypted.attachment.buffer],
+          { type: decrypted.attachment.mimetype || 'application/octet-stream' }
+        );
+        const url = URL.createObjectURL(blob);
+        setAttachment({ filename: decrypted.attachment.filename, url });
+      } else {
+        setAttachment(null);
+      }
+
       setStatus('success');
       setPinInput(''); // Clear PIN immediately
     } catch (err) {
@@ -127,6 +156,7 @@ function ViewSecret() {
       {status === 'ready' && (
         <form onSubmit={handleReveal}>
           <p>A secret has been shared with you.</p>
+          {metaInfo.hasAttachment && <p>This secret includes a file attachment.</p>}
           {metaInfo.hasPin && (
             <div style={{ margin: '1rem 0' }}>
               <label>
@@ -155,9 +185,18 @@ function ViewSecret() {
       )}
       
       {status === 'success' && (
-        <pre style={{ whiteSpace: 'pre-wrap', textAlign: 'left', padding: '1rem', border: '1px solid #ccc' }}>
-          {plaintext}
-        </pre>
+        <>
+          <pre style={{ whiteSpace: 'pre-wrap', textAlign: 'left', padding: '1rem', border: '1px solid #ccc' }}>
+            {plaintext}
+          </pre>
+          {attachment && (
+            <p>
+              <a href={attachment.url} download={attachment.filename}>
+                Download attachment: {attachment.filename}
+              </a>
+            </p>
+          )}
+        </>
       )}
     </main>
   );

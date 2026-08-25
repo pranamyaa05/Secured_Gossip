@@ -1,5 +1,10 @@
 import { useState } from 'react';
-import { encryptContent, encryptContentWithPin } from './crypto.js';
+import {
+  encryptContentAndAttachment,
+  encryptContentAndAttachmentWithPin,
+  MAX_ATTACHMENT_BYTES,
+  ALLOWED_ATTACHMENT_EXTENSIONS,
+} from './crypto.js';
 
 const API_BASE = 'http://localhost:3001';
 
@@ -21,13 +26,45 @@ function CreateSecret() {
   const [burnAfterRead, setBurnAfterRead] = useState(false);
   const [enablePin, setEnablePin] = useState(false);
   const [pin, setPin] = useState('');
-  
+
+  const [file, setFile] = useState(null);
+  const [fileError, setFileError] = useState('');
+  const [fileInputKey, setFileInputKey] = useState(0); // bump to force-clear the <input type="file">
+
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   const [activeSecret, setActiveSecret] = useState(null);
   const [statusLoading, setStatusLoading] = useState(false);
   const [revokeLoading, setRevokeLoading] = useState(false);
+
+  function handleFileChange(e) {
+    const selected = e.target.files && e.target.files[0];
+    setFileError('');
+
+    if (!selected) {
+      setFile(null);
+      return;
+    }
+
+    if (selected.size > MAX_ATTACHMENT_BYTES) {
+      setFileError(`File exceeds the ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB limit.`);
+      setFile(null);
+      return;
+    }
+
+    const lastDot = selected.name.lastIndexOf('.');
+    const ext = lastDot >= 0 ? selected.name.slice(lastDot).toLowerCase() : '';
+    if (!ALLOWED_ATTACHMENT_EXTENSIONS.includes(ext)) {
+      // Client-side convenience check only — the server never inspects file
+      // type or contents, it only ever sees an opaque encrypted blob.
+      setFileError('Unsupported file type for this demo.');
+      setFile(null);
+      return;
+    }
+
+    setFile(selected);
+  }
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -44,18 +81,28 @@ function CreateSecret() {
       return;
     }
 
+    if (file && file.size > MAX_ATTACHMENT_BYTES) {
+      setError(`Attachment exceeds the ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB limit.`);
+      return;
+    }
+
     setSubmitting(true);
     try {
       let payload;
       let urlFragmentKey;
 
       if (enablePin) {
-        const { ciphertext, iv, fragmentKey, salt } = await encryptContentWithPin(text, pin);
-        payload = { ciphertext, iv, expiresInSeconds, burnAfterRead, pin, contentSalt: salt };
+        const { ciphertext, iv, fragmentKey, salt, attachmentCiphertext, attachmentIv } =
+          await encryptContentAndAttachmentWithPin(text, pin, file);
+        payload = {
+          ciphertext, iv, expiresInSeconds, burnAfterRead, pin, contentSalt: salt,
+          attachmentCiphertext, attachmentIv,
+        };
         urlFragmentKey = fragmentKey;
       } else {
-        const { ciphertext, iv, key } = await encryptContent(text);
-        payload = { ciphertext, iv, expiresInSeconds, burnAfterRead };
+        const { ciphertext, iv, key, attachmentCiphertext, attachmentIv } =
+          await encryptContentAndAttachment(text, file);
+        payload = { ciphertext, iv, expiresInSeconds, burnAfterRead, attachmentCiphertext, attachmentIv };
         urlFragmentKey = key;
       }
 
@@ -71,7 +118,7 @@ function CreateSecret() {
 
       const { id, deleteToken } = await response.json();
       const url = `${window.location.origin}/#/view/${id}#${urlFragmentKey}`;
-      
+
       setActiveSecret({
         id,
         link: url,
@@ -83,6 +130,9 @@ function CreateSecret() {
       setText('');
       setPin('');
       setEnablePin(false);
+      setFile(null);
+      setFileError('');
+      setFileInputKey((k) => k + 1); // remounts the file input, clearing its displayed value
     } catch (err) {
       setError('Failed to create secret. Please try again.');
     } finally {
@@ -199,6 +249,24 @@ function CreateSecret() {
               </label>
             </div>
           )}
+
+          <div style={{ margin: '1rem 0' }}>
+            <label>
+              Attach a file (optional, max {Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB):{' '}
+              <input
+                key={fileInputKey}
+                type="file"
+                accept={ALLOWED_ATTACHMENT_EXTENSIONS.join(',')}
+                onChange={handleFileChange}
+              />
+            </label>
+            {file && (
+              <p style={{ fontSize: '0.85em' }}>
+                Selected: {file.name} ({Math.round(file.size / 1024)} KB)
+              </p>
+            )}
+            {fileError && <p style={{ color: 'red', fontSize: '0.85em' }}>{fileError}</p>}
+          </div>
 
           <button type="submit" disabled={submitting}>
             {submitting ? 'Encrypting...' : 'Create Secret'}

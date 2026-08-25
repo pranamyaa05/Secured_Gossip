@@ -13,6 +13,15 @@ const MAX_PIN_ATTEMPTS = 5;
 const REVEAL_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const REVEAL_RATE_LIMIT_MAX = 30;
 
+// Attachment size guard, expressed as a max length for the transmitted
+// base64url ciphertext string. A 5MB plaintext file inflates to roughly:
+//   5MB -> base64url (inner, ~1.33x) -> +16 byte GCM tag -> base64url (outer, ~1.33x)
+//   ≈ 8.9MB of ciphertext text. 10MB leaves comfortable margin.
+// This is defense-in-depth on top of the JSON body size limit below — both
+// exist because a body-limit rejection is a generic, unfriendly error,
+// while this check gives a specific, clear one.
+const MAX_ATTACHMENT_CIPHERTEXT_LENGTH = 10 * 1024 * 1024;
+
 // In-memory store for ciphertext and crypto parameters.
 const pastes = new Map();
 
@@ -23,7 +32,12 @@ const pastes = new Map();
 const pasteStatus = new Map();
 
 app.use(cors());
-app.use(express.json());
+// Body limit raised from Express's 100kb default to accommodate encrypted
+// file attachments (see MAX_ATTACHMENT_CIPHERTEXT_LENGTH above for the math).
+// NOTE: this is an anonymous, unauthenticated, in-memory store — for a
+// production deployment this limit plus a lack of per-IP upload quotas is a
+// real memory-exhaustion risk. Accepted trade-off for this hackathon build.
+app.use(express.json({ limit: '12mb' }));
 
 const revealHits = new Map();
 function isRateLimited(ip) {
@@ -61,6 +75,8 @@ app.post('/pastes', (req, res) => {
     burnAfterRead = false,
     pin,
     contentSalt,
+    attachmentCiphertext,
+    attachmentIv,
   } = req.body || {};
 
   if (typeof ciphertext !== 'string' || typeof iv !== 'string' || !ciphertext || !iv) {
@@ -83,6 +99,24 @@ app.post('/pastes', (req, res) => {
     pinHash = hashPin(pin, pinSalt);
   }
 
+  // Attachment fields must be provided together, or not at all — never one
+  // without the other, since decryption of the file needs both.
+  let hasAttachment = false;
+  if (attachmentCiphertext !== undefined || attachmentIv !== undefined) {
+    if (
+      typeof attachmentCiphertext !== 'string' || !attachmentCiphertext ||
+      typeof attachmentIv !== 'string' || !attachmentIv
+    ) {
+      return res.status(400).json({
+        error: 'attachmentCiphertext and attachmentIv must both be provided together as non-empty strings',
+      });
+    }
+    if (attachmentCiphertext.length > MAX_ATTACHMENT_CIPHERTEXT_LENGTH) {
+      return res.status(413).json({ error: 'attachment too large' });
+    }
+    hasAttachment = true;
+  }
+
   const id = crypto.randomUUID();
   const deleteToken = crypto.randomBytes(24).toString('base64url');
   const deleteTokenHash = sha256Hex(deleteToken);
@@ -98,6 +132,8 @@ app.post('/pastes', (req, res) => {
     pinSalt,
     pinAttempts: 0,
     contentSalt: hasPin ? contentSalt : null,
+    attachmentCiphertext: hasAttachment ? attachmentCiphertext : null,
+    attachmentIv: hasAttachment ? attachmentIv : null,
     deleteTokenHash,
   });
 
@@ -156,7 +192,7 @@ app.get('/pastes/:id/meta', (req, res) => {
     return res.status(404).json({ error: 'not found' });
   }
 
-  res.json({ hasPin: paste.hasPin });
+  res.json({ hasPin: paste.hasPin, hasAttachment: Boolean(paste.attachmentCiphertext) });
 });
 
 app.post('/pastes/:id/reveal', (req, res) => {
@@ -201,6 +237,10 @@ app.post('/pastes/:id/reveal', (req, res) => {
 
   const payload = { ciphertext: paste.ciphertext, iv: paste.iv };
   if (paste.hasPin) payload.contentSalt = paste.contentSalt;
+  if (paste.attachmentCiphertext) {
+    payload.attachmentCiphertext = paste.attachmentCiphertext;
+    payload.attachmentIv = paste.attachmentIv;
+  }
 
   // Mark as seen *before* potential burn-after-read deletion
   if (meta) {
