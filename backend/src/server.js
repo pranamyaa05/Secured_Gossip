@@ -1,9 +1,12 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
 import crypto from "node:crypto";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Trust reverse proxy (e.g., Render) so req.ip reflects real client IP for rate limiting
+app.set("trust proxy", 1);
 
 const PIN_ITERATIONS = 300000;
 const PIN_KEYLEN = 32;
@@ -15,7 +18,22 @@ const REVEAL_RATE_LIMIT_MAX = 30;
 const pastes = new Map();
 const pasteStatus = new Map();
 
-app.use(cors());
+// In production, set ALLOWED_ORIGINS=https://your-app.vercel.app (comma-separated if multiple).
+// In local dev without ALLOWED_ORIGINS, all origins are permitted.
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+  : null;
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (!allowedOrigins) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin '${origin}' not allowed`));
+  },
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-delete-token"],
+}));
 app.use(express.json({ limit: "15mb" }));
 
 const revealHits = new Map();

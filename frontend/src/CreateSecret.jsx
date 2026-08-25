@@ -13,7 +13,7 @@ import {
 } from './crypto.js';
 import gossipImage from './assets/gossip.png';
 
-const API_BASE = 'http://localhost:3001';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
 
 function formatStatus(status) {
   switch (status) {
