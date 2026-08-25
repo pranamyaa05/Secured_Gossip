@@ -71,6 +71,7 @@ flowchart TD
     Crypto -.->|"Implements"| PIN
     Store -.->|"Enforces"| TA
     Store -.->|"Enforces"| BR
+```
 ### Component Breakdown
 | Layer | Technology | Responsibility |
 |-------|------------|----------------|
