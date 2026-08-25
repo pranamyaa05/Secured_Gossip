@@ -174,28 +174,32 @@ function CreateSecret() {
           burnAfterRead,
           pin,
           contentSalt: encryptedData.salt,
+          notBefore: notBeforeTimestamp,
+          notAfter: notAfterTimestamp,
           attachmentCiphertext: encryptedData.attachmentCiphertext,
           attachmentIv: encryptedData.attachmentIv
         };
         urlFragmentKey = encryptedData.fragmentKey;
       } else if (mode === 'multiple') {
-        const { raw: dekRaw } = await generateKey();
-        const dek = await importKey(dekRaw);
-        const { ciphertext, iv } = await encrypt(dek, text);
+        const { key: dekKey } = await generateKey();
+        const { ciphertext, iv } = await encrypt(dekKey, text);
 
         let attachmentCiphertext = null;
         let attachmentIv = null;
         if (file) {
           const attachmentPlaintext = await buildAttachmentPlaintext(file);
-          const attEncrypted = await encrypt(dek, attachmentPlaintext);
-          attachmentCiphertext = attEncrypted.ciphertext;
-          attachmentIv = attEncrypted.iv;
+          const attEnc = await encrypt(dekKey, attachmentPlaintext);
+          attachmentCiphertext = attEnc.ciphertext;
+          attachmentIv = attEnc.iv;
         }
 
+        const validRecipients = recipients.filter(r => r.id.trim() && r.passphrase.trim());
+        const exportedDekBytes = await crypto.subtle.exportKey('raw', dekKey);
+
         const keyEnvelopes = await Promise.all(
-          recipients.filter(r => r.id.trim() && r.passphrase.trim()).map(async (recipient) => {
+          validRecipients.map(async (recipient) => {
             const { encryptedKey, salt, iv: wrapIv } = await wrapKeyWithPassphrase(
-              await crypto.subtle.exportKey('raw', dek),
+              exportedDekBytes,
               recipient.passphrase.trim()
             );
             return {
@@ -214,6 +218,8 @@ function CreateSecret() {
           burnAfterRead,
           keyEnvelopes,
           isMulti: true,
+          notBefore: notBeforeTimestamp,
+          notAfter: notAfterTimestamp,
           attachmentCiphertext,
           attachmentIv
         };
@@ -226,11 +232,11 @@ function CreateSecret() {
           expiresInSeconds,
           burnAfterRead,
           version: encryptedData.version,
+          notBefore: notBeforeTimestamp,
+          notAfter: notAfterTimestamp,
           attachmentCiphertext: encryptedData.attachmentCiphertext,
           attachmentIv: encryptedData.attachmentIv
         };
-        if (notBeforeTimestamp !== null) payload.notBefore = notBeforeTimestamp;
-        if (notAfterTimestamp !== null) payload.notAfter = notAfterTimestamp;
         urlFragmentKey = encryptedData.key;
       }
 
@@ -315,9 +321,7 @@ function CreateSecret() {
       await navigator.clipboard.writeText(activeSecret.link);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch (err) {
-      // Clipboard fallback
-    }
+    } catch (err) {}
   }
 
   function openRecipientView() {
@@ -401,44 +405,22 @@ function CreateSecret() {
               </div>
 
               {mode === 'single' && (
-                <>
-                  <div className="field">
-                    <label className="field-checkbox">
-                      Require a PIN to unlock
-                      <input type="checkbox" checked={enablePin} onChange={(e) => setEnablePin(e.target.checked)} />
-                    </label>
-                  </div>
+                <div className="field">
+                  <label className="field-checkbox">
+                    Require a PIN to unlock
+                    <input type="checkbox" checked={enablePin} onChange={(e) => setEnablePin(e.target.checked)} />
+                  </label>
+                </div>
+              )}
 
-                  {enablePin && (
-                    <div className="field">
-                      <span className="eyebrow">PIN (4–32 characters)</span>
-                      <input
-                        type="password" className="field-input" value={pin}
-                        onChange={(e) => setPin(e.target.value)} minLength={4} maxLength={32}
-                      />
-                    </div>
-                  )}
-
-                  <div className="field">
-                    <span className="eyebrow">Access Schedule (Optional)</span>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '0.5rem' }}>
-                      <div>
-                        <span style={{ fontSize: '0.85rem', color: 'var(--ink-muted)' }}>Available from:</span>
-                        <input
-                          type="datetime-local" className="field-input" value={notBefore}
-                          onChange={(e) => setNotBefore(e.target.value)}
-                        />
-                      </div>
-                      <div>
-                        <span style={{ fontSize: '0.85rem', color: 'var(--ink-muted)' }}>Available until:</span>
-                        <input
-                          type="datetime-local" className="field-input" value={notAfter}
-                          onChange={(e) => setNotAfter(e.target.value)}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </>
+              {mode === 'single' && enablePin && (
+                <div className="field">
+                  <span className="eyebrow">PIN (4–32 characters)</span>
+                  <input
+                    type="password" className="field-input" value={pin}
+                    onChange={(e) => setPin(e.target.value)} minLength={4} maxLength={32}
+                  />
+                </div>
               )}
 
               {mode === 'multiple' && (
@@ -489,6 +471,26 @@ function CreateSecret() {
                   </button>
                 </div>
               )}
+
+              <div className="field">
+                <span className="eyebrow">Access Schedule (Optional)</span>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '0.5rem' }}>
+                  <div>
+                    <span style={{ fontSize: '0.85rem', color: 'var(--ink-muted)' }}>Available from:</span>
+                    <input
+                      type="datetime-local" className="field-input" value={notBefore}
+                      onChange={(e) => setNotBefore(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <span style={{ fontSize: '0.85rem', color: 'var(--ink-muted)' }}>Available until:</span>
+                    <input
+                      type="datetime-local" className="field-input" value={notAfter}
+                      onChange={(e) => setNotAfter(e.target.value)}
+                    />
+                  </div>
+                </div>
+              </div>
 
               <button type="submit" className="btn btn-primary-light btn-block" disabled={submitting} style={{ marginTop: '1rem' }}>
                 {submitting ? 'Encrypting…' : 'Create Secret'}

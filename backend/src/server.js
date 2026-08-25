@@ -33,8 +33,8 @@ function isRateLimited(ip) {
 function isExpired(pasteOrMeta) {
   const now = Date.now();
   if (now > pasteOrMeta.createdAt + pasteOrMeta.expiresInSeconds * 1000) return true;
-  if (pasteOrMeta.notBefore !== null && pasteOrMeta.notBefore !== undefined && now < pasteOrMeta.notBefore) return true;
-  if (pasteOrMeta.notAfter !== null && pasteOrMeta.notAfter !== undefined && now > pasteOrMeta.notAfter) return true;
+  if (pasteOrMeta.notBefore && now < pasteOrMeta.notBefore) return true;
+  if (pasteOrMeta.notAfter && now > pasteOrMeta.notAfter) return true;
   return false;
 }
 
@@ -77,21 +77,12 @@ app.post("/pastes", (req, res) => {
 
   if (notBefore !== undefined && notBefore !== null && notBefore !== "") {
     const notBeforeNum = Number(notBefore);
-    if (isNaN(notBeforeNum) || notBeforeNum <= now) {
-      return res.status(400).json({ error: "notBefore must be a future timestamp" });
-    }
-    validNotBefore = notBeforeNum;
+    if (!isNaN(notBeforeNum)) validNotBefore = notBeforeNum;
   }
 
   if (notAfter !== undefined && notAfter !== null && notAfter !== "") {
     const notAfterNum = Number(notAfter);
-    if (isNaN(notAfterNum) || notAfterNum <= now) {
-      return res.status(400).json({ error: "notAfter must be a future timestamp" });
-    }
-    if (validNotBefore !== null && notAfterNum <= validNotBefore) {
-      return res.status(400).json({ error: "notAfter must be after notBefore" });
-    }
-    validNotAfter = notAfterNum;
+    if (!isNaN(notAfterNum)) validNotAfter = notAfterNum;
   }
 
   let hasPin = false;
@@ -126,7 +117,7 @@ app.post("/pastes", (req, res) => {
     pinAttempts: 0,
     contentSalt: hasPin ? contentSalt : null,
     deleteTokenHash,
-    version: Number(version) || 0,
+    version: Number(version) || 1,
     keyEnvelopes: Array.isArray(keyEnvelopes) ? keyEnvelopes : [],
     isMulti: Boolean(isMulti),
     notBefore: validNotBefore,
@@ -145,7 +136,7 @@ app.post("/pastes", (req, res) => {
     notAfter: validNotAfter
   });
 
-  res.status(201).json({ id, deleteToken, version: Number(version) || 0 });
+  res.status(201).json({ id, deleteToken, version: Number(version) || 1 });
 });
 
 app.get("/pastes/:id/meta", (req, res) => {
@@ -215,12 +206,18 @@ app.post("/pastes/:id/reveal", (req, res) => {
   const paste = pastes.get(id);
   const meta = pasteStatus.get(id);
 
-  if (!paste || isExpired(paste)) {
-    if (paste && (Date.now() > paste.createdAt + paste.expiresInSeconds * 1000 || (paste.notAfter && Date.now() > paste.notAfter))) {
-      pastes.delete(id);
-      if (meta && meta.status === "waiting") meta.status = "expired";
-    }
-    return res.status(404).json({ error: "not found or not currently available" });
+  if (!paste) {
+    return res.status(404).json({ error: "not found" });
+  }
+
+  const now = Date.now();
+  if (paste.notBefore && now < paste.notBefore) {
+    return res.status(403).json({ error: `Not available until ${new Date(paste.notBefore).toLocaleString()}` });
+  }
+  if (now > paste.createdAt + paste.expiresInSeconds * 1000 || (paste.notAfter && now > paste.notAfter)) {
+    pastes.delete(id);
+    if (meta && meta.status === "waiting") meta.status = "expired";
+    return res.status(404).json({ error: "expired" });
   }
 
   if (!paste.isMulti) {

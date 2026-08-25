@@ -162,6 +162,10 @@ function ViewSecret() {
             setErrorMessage(`Incorrect PIN. ${errData.attemptsRemaining} attempts remaining.`);
           }
           return;
+        } else if (response.status === 403) {
+          setStatus('error');
+          setErrorMessage(errData.error || 'Access schedule violation: secret is locked.');
+          return;
         } else if (response.status === 429) {
           setStatus('error');
           setErrorMessage(errData.error || 'Too many attempts. Secret deleted or rate limited.');

@@ -1,6 +1,5 @@
 /**
- * AES-GCM encryption/decryption utilities using the Web Crypto API.
- * Works in browsers and in Node.js (via globalThis.crypto).
+ * AES-GCM encryption/decryption utilities using Web Crypto API.
  */
 
 const encoder = new TextEncoder();
@@ -84,7 +83,6 @@ export async function decrypt(key, base64Ciphertext, base64Iv) {
   return decoder.decode(decrypted);
 }
 
-// Attachment helpers
 export async function buildAttachmentPlaintext(file) {
   if (file.size > MAX_ATTACHMENT_BYTES) {
     throw new Error(`Attachment exceeds ${MAX_ATTACHMENT_BYTES / (1024 * 1024)}MB limit`);
@@ -123,9 +121,9 @@ export async function encryptContent(plaintext, file = null) {
 
   if (file) {
     const attachmentPlaintext = await buildAttachmentPlaintext(file);
-    const { ciphertext: attachmentCiphertext, iv: attachmentIv } = await encrypt(key, attachmentPlaintext);
-    result.attachmentCiphertext = attachmentCiphertext;
-    result.attachmentIv = attachmentIv;
+    const attEnc = await encrypt(key, attachmentPlaintext);
+    result.attachmentCiphertext = attEnc.ciphertext;
+    result.attachmentIv = attEnc.iv;
   }
 
   return result;
@@ -190,9 +188,9 @@ export async function encryptContentWithPin(plaintext, pin, file = null) {
 
   if (file) {
     const attachmentPlaintext = await buildAttachmentPlaintext(file);
-    const { ciphertext: attachmentCiphertext, iv: attachmentIv } = await encrypt(key, attachmentPlaintext);
-    result.attachmentCiphertext = attachmentCiphertext;
-    result.attachmentIv = attachmentIv;
+    const attEnc = await encrypt(key, attachmentPlaintext);
+    result.attachmentCiphertext = attEnc.ciphertext;
+    result.attachmentIv = attEnc.iv;
   }
 
   return result;
@@ -235,10 +233,12 @@ export async function wrapKeyWithPassphrase(keyBytes, passphrase, iterations = P
   );
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
+  const rawKeyData = keyBytes instanceof ArrayBuffer ? new Uint8Array(keyBytes) : keyBytes;
+
   const encryptedKey = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
     wrappingKey,
-    keyBytes
+    rawKeyData
   );
 
   return {
@@ -265,7 +265,7 @@ export async function unwrapKeyWithPassphrase(encryptedKeyBase64, saltBase64, iv
   const wrappingKey = await crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
-      salt: salt,
+      salt: new Uint8Array(salt),
       iterations: iterations,
       hash: 'SHA-256'
     },
@@ -276,12 +276,12 @@ export async function unwrapKeyWithPassphrase(encryptedKeyBase64, saltBase64, iv
   );
 
   const decryptedKey = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv },
+    { name: 'AES-GCM', iv: new Uint8Array(iv) },
     wrappingKey,
     encryptedKey
   );
 
-  return arrayBufferToBase64Url(decryptedKey);
+  return new Uint8Array(decryptedKey);
 }
 
 export async function getMasterSecret() { return new Uint8Array(32); }
