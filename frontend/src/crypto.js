@@ -1,6 +1,7 @@
 /**
  * AES-GCM encryption/decryption utilities using the Web Crypto API.
  * Works in browsers and in Node.js (via globalThis.crypto).
+ * Includes forward secrecy via hierarchical keys (master secret -> per-paste DEK).
  */
 
 const encoder = new TextEncoder();
@@ -11,25 +12,208 @@ const decoder = new TextDecoder();
 // independent derivations with independent salts, but both should be slow).
 export const PBKDF2_ITERATIONS = 300000;
 
-// Attachment constraints (client-side convenience checks only — the server
-// enforces its own independent size cap; neither side inspects file contents).
-export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5 MB plaintext
-export const ALLOWED_ATTACHMENT_EXTENSIONS = [
-  // images
-  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp',
-  // documents
-  '.pdf',
-  // text / code
-  '.txt', '.md', '.c', '.cpp', '.h', '.hpp', '.java', '.py',
-  '.html', '.htm', '.css', '.js', '.jsx', '.ts', '.tsx',
-  '.json', '.xml', '.yml', '.yaml', '.sh', '.csv',
-];
+// Forward secrecy: master secret and key versioning
+const MASTER_SECRET_KEY = 'secured-gossip-master-secret';
+
+/**
+ * Get or create the master secret stored in localStorage.
+ * The master secret is rotated periodically to provide forward secrecy.
+ * @returns {Promise<Uint8Array>} The master secret as raw bytes
+ */
+export async function getMasterSecret() {
+  let masterSecretB64 = localStorage.getItem(MASTER_SECRET_KEY);
+  if (!masterSecretB64) {
+    // Generate a new master secret (256 bits = 32 bytes)
+    const masterSecret = crypto.getRandomValues(new Uint8Array(32));
+    masterSecretB64 = arrayBufferToBase64Url(masterSecret);
+    localStorage.setItem(MASTER_SECRET_KEY, masterSecretB64);
+  }
+  return base64UrlToArrayBuffer(masterSecretB64);
+}
+
+/**
+ * Set a new master secret (for rotation).
+ * @param {Uint8Array} newSecret - The new master secret as raw bytes
+ */
+export function setMasterSecret(newSecret) {
+  const masterSecretB64 = arrayBufferToBase64Url(newSecret);
+  localStorage.setItem(MASTER_SECRET_KEY, masterSecretB64);
+}
+
+/**
+ * Get the current key version based on time.
+ * For daily rotation: floor(Date.now() / (24 * 60 * 60 * 1000))
+ * @returns {number} The current key version
+ */
+export function getKeyVersion() {
+  return Math.floor(Date.now() / (24 * 60 * 60 * 1000)); // Daily rotation
+}
+
+/**
+ * HKDF-SHA256 implementation using Web Crypto API.
+ * Follows RFC 5869 HMAC-based Extract-and-Expand Key Derivation Function.
+ * @param {string|Uint8Array} salt - Salt value (optional)
+ * @param {string|Uint8Array} ikm - Input key material
+ * @param {string|Uint8Array} info - Context/application-specific info (optional)
+ * @param {number} length - Length of output key material in bytes
+ * @returns {Promise<Uint8Array>} Derived key material
+ */
+export async function hkdf(salt, ikm, info, length) {
+  // Convert inputs to Uint8Array if they're strings
+  const saltBytes = typeof salt === 'string'
+    ? encoder.encode(salt)
+    : salt;
+  const ikmBytes = typeof ikm === 'string'
+    ? encoder.encode(ikm)
+    : ikm;
+  const infoBytes = typeof info === 'string'
+    ? encoder.encode(info)
+    : info;
+
+  // Step 1: Extract
+  const extractKey = await crypto.subtle.importKey(
+    'raw',
+    saltBytes || new Uint8Array(0), // Use empty salt if not provided
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const extractResult = await crypto.subtle.sign(
+    'HMAC',
+    extractKey,
+    ikmBytes
+  );
+  const prk = new Uint8Array(extractResult); // Pseudo-random key
+
+  // Step 2: Expand
+  const expandKey = await crypto.subtle.importKey(
+    'raw',
+    prk,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  // Create T = info || 0x01
+  const TBuffer = new Uint8Array(infoBytes.length + 1);
+  TBuffer.set(infoBytes);
+  TBuffer[TBuffer.length - 1] = 0x01;
+
+  const expandResult = await crypto.subtle.sign(
+    'HMAC',
+    expandKey,
+    TBuffer
+  );
+  const okm = new Uint8Array(expandResult); // Output key material
+
+  return okm.subarray(0, length);
+}
+
+const cryptoInstance = globalThis.crypto;
+export { cryptoInstance as crypto };
+
+// Envelope encryption for multi-recipient using passphrase-derived keys
+/**
+ * Encrypt a key (CEK) with a passphrase using PBKDF2 and AES-GCM.
+ * @param {Uint8Array} key - The key to encrypt (CEK)
+ * @param {string} passphrase - The recipient's passphrase
+ * @param {number} iterations - PBKDF2 iteration count
+ * @returns {Promise<{encryptedKey: string, salt: string, iv: string}>}
+ *          encryptedKey, salt, iv are base64url-encoded
+ */
+export async function wrapKeyWithPassphrase(key, passphrase, iterations = PBKDF2_ITERATIONS) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const ikm = encoder.encode(passphrase);
+
+  // Derive encryption key from passphrase
+  const encKey = await crypto.subtle.importKey(
+    'raw',
+    ikm,
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+
+  const wrappingKey = await crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: salt,
+      iterations: iterations,
+      hash: 'SHA-256'
+    },
+    encKey,
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt']
+  );
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encryptedKey = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    wrappingKey,
+    key
+  );
+
+  return {
+    encryptedKey: arrayBufferToBase64Url(encryptedKey),
+    salt: arrayBufferToBase64Url(salt),
+    iv: arrayBufferToBase64Url(iv)
+  };
+}
+
+/**
+ * Decrypt a key (CEK) that was encrypted with wrapKeyWithPassphrase.
+ * @param {string} encryptedKeyBase64 - base64url encrypted key
+ * @param {string} saltBase64 - base64url salt
+ * @param {string} ivBase64 - base64url iv
+ * @param {string} passphrase - The recipient's passphrase
+ * @param {number} iterations - PBKDF2 iteration count
+ * @returns {Promise<Uint8Array>} The decrypted key
+ */
+export async function unwrapKeyWithPassphrase(encryptedKeyBase64, saltBase64, ivBase64, passphrase, iterations = PBKDF2_ITERATIONS) {
+  const encryptedKey = base64UrlToArrayBuffer(encryptedKeyBase64);
+  const salt = base64UrlToArrayBuffer(saltBase64);
+  const iv = base64UrlToArrayBuffer(ivBase64);
+
+  const ikm = encoder.encode(passphrase);
+
+  // Derive encryption key from passphrase
+  const encKey = await crypto.subtle.importKey(
+    'raw',
+    ikm,
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+
+  const wrappingKey = await crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: salt,
+      iterations: iterations,
+      hash: 'SHA-256'
+    },
+    encKey,
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['decrypt']
+  );
+
+  const decryptedKey = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    wrappingKey,
+    encryptedKey
+  );
+
+  return new Uint8Array(decryptedKey);
+}
 
 /**
  * Convert a base64url string to an ArrayBuffer.
  * Reverses the URL-safe encoding: '-' -> '+', '_' -> '/', padding restored.
  */
-function base64UrlToArrayBuffer(base64Url) {
+export function base64UrlToArrayBuffer(base64Url) {
   let base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
   // Restore '=' padding to a multiple of 4.
   while (base64.length % 4 !== 0) {
@@ -47,7 +231,7 @@ function base64UrlToArrayBuffer(base64Url) {
  * Convert an ArrayBuffer to a base64url string.
  * URL-safe: '+ ' -> '-', '/' -> '_', '=' padding stripped.
  */
-function arrayBufferToBase64Url(buffer) {
+export function arrayBufferToBase64Url(buffer) {
   const bytes = new Uint8Array(buffer);
   let binary = '';
   for (let i = 0; i < bytes.length; i++) {
@@ -88,9 +272,6 @@ export async function importKey(base64Key) {
 
 /**
  * Encrypt a plaintext string with the given CryptoKey.
- * Generates a FRESH random IV on every call — safe to call multiple times
- * with the same key (e.g. once for text, once for an attachment) because
- * each call gets its own independent 96-bit random IV.
  * Returns { ciphertext: base64, iv: base64 }.
  */
 export async function encrypt(key, plaintext) {
@@ -124,27 +305,37 @@ export async function decrypt(key, base64Ciphertext, base64Iv) {
 }
 
 /**
- * Encrypt string content with a fresh random 256-bit AES-GCM key.
- * (Unchanged, non-PIN flow: the key lives only in the URL fragment.)
+ * Encrypt string content using forward secrecy via hierarchical keys.
+ * Derives a per-paste DEK from master secret + version using HKDF.
+ * The DEK is NOT returned; it must be re-derived using the same master secret and version.
  * @param {string} plaintext - content to encrypt
- * @returns {Promise<{ciphertext: string, iv: string, key: string}>}
- *          ciphertext, iv, key are base64-encoded.
+ * @returns {Promise<{ciphertext: string, iv: string, version: number}>}
+ *          ciphertext, iv are base64-encoded; version is the key version used.
  */
 export async function encryptContent(plaintext) {
-  // Generate a fresh random 256-bit key (32 bytes) as required by the spec.
-  const rawKey = crypto.getRandomValues(new Uint8Array(32));
+  // Get master secret and current version for forward secrecy
+  const masterSecret = await getMasterSecret();
+  const version = getKeyVersion();
+
+  // Derive per-paste DEK using HKDF: salt = "secured-gossip-v" + version,
+  // IKM = master secret, info = "paste", length = 32 bytes
+  const salt = `secured-gossip-v${version}`;
+  const dek = await hkdf(salt, masterSecret, "paste", 32);
+
+  // Import the derived key for encryption
   const key = await crypto.subtle.importKey(
     'raw',
-    rawKey,
+    dek,
     { name: 'AES-GCM' },
     true,
     ['encrypt', 'decrypt']
   );
+
   const { ciphertext, iv } = await encrypt(key, plaintext);
   return {
     ciphertext,
     iv,
-    key: arrayBufferToBase64Url(rawKey), // base64url-encoded key
+    version // Return version so client knows which master secret to use
   };
 }
 
@@ -258,134 +449,4 @@ export async function encryptContentWithPin(plaintext, pin) {
 export async function decryptContentWithPin(base64Ciphertext, base64Iv, fragmentKeyB64, pin, saltB64) {
   const key = await derivePinContentKey(fragmentKeyB64, pin, saltB64);
   return decrypt(key, base64Ciphertext, base64Iv);
-}
-
-// ---------------------------------------------------------------------------
-// Attachments (encrypted-metadata approach).
-//
-// The attachment's filename + MIME type are bundled INSIDE the encrypted
-// payload (as JSON, alongside the base64url-encoded file bytes), so the
-// server never sees the filename or MIME type in plaintext either.
-//
-// The attachment reuses the SAME content key as the text (whichever key was
-// used — random fragment key alone, or the PIN-derived key), but gets its
-// OWN independent call to encrypt(), which means its own fresh random IV.
-// Reusing a key is safe in AES-GCM as long as the IV is never reused with
-// that key; encrypt() guarantees a fresh IV on every call.
-// ---------------------------------------------------------------------------
-
-/**
- * Read a File/Blob into a JSON string ready for encryption:
- * { filename, mimetype, data: base64url(file bytes) }
- */
-async function buildAttachmentPlaintext(file) {
-  if (file.size > MAX_ATTACHMENT_BYTES) {
-    throw new Error(`Attachment exceeds ${MAX_ATTACHMENT_BYTES / (1024 * 1024)}MB limit`);
-  }
-  const buffer = await file.arrayBuffer();
-  const dataB64 = arrayBufferToBase64Url(buffer);
-  return JSON.stringify({
-    filename: file.name,
-    mimetype: file.type || 'application/octet-stream',
-    data: dataB64,
-  });
-}
-
-/**
- * Reverse buildAttachmentPlaintext(): decrypted JSON string -> usable parts.
- * @returns {{filename: string, mimetype: string, buffer: ArrayBuffer}}
- */
-function parseAttachmentPlaintext(jsonString) {
-  const { filename, mimetype, data } = JSON.parse(jsonString);
-  const buffer = base64UrlToArrayBuffer(data);
-  return { filename, mimetype, buffer };
-}
-
-/**
- * Non-PIN flow: encrypt text and (optionally) an attachment with one fresh
- * random 256-bit key. If `file` is null/undefined, behaves identically to
- * encryptContent() — no attachment fields are included in the result.
- * @param {string} plaintext
- * @param {File|null} file
- */
-export async function encryptContentAndAttachment(plaintext, file) {
-  const rawKey = crypto.getRandomValues(new Uint8Array(32));
-  const key = await crypto.subtle.importKey(
-    'raw', rawKey, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']
-  );
-  const { ciphertext, iv } = await encrypt(key, plaintext);
-  const result = { ciphertext, iv, key: arrayBufferToBase64Url(rawKey) };
-
-  if (file) {
-    const attachmentPlaintext = await buildAttachmentPlaintext(file);
-    const { ciphertext: attachmentCiphertext, iv: attachmentIv } = await encrypt(key, attachmentPlaintext);
-    result.attachmentCiphertext = attachmentCiphertext;
-    result.attachmentIv = attachmentIv;
-  }
-
-  return result;
-}
-
-/**
- * PIN flow: encrypt text and (optionally) an attachment with the same
- * PIN-derived key. If `file` is null/undefined, behaves identically to
- * encryptContentWithPin() — no attachment fields are included in the result.
- * @param {string} plaintext
- * @param {string} pin
- * @param {File|null} file
- */
-export async function encryptContentAndAttachmentWithPin(plaintext, pin, file) {
-  const fragmentKey = generateFragmentKey();
-  const salt = generateSalt();
-  const key = await derivePinContentKey(fragmentKey, pin, salt);
-  const { ciphertext, iv } = await encrypt(key, plaintext);
-  const result = { ciphertext, iv, fragmentKey, salt };
-
-  if (file) {
-    const attachmentPlaintext = await buildAttachmentPlaintext(file);
-    const { ciphertext: attachmentCiphertext, iv: attachmentIv } = await encrypt(key, attachmentPlaintext);
-    result.attachmentCiphertext = attachmentCiphertext;
-    result.attachmentIv = attachmentIv;
-  }
-
-  return result;
-}
-
-/**
- * Non-PIN flow: decrypt text and (optionally) an attachment.
- * Pass attachmentCiphertext/attachmentIv as undefined when there is none —
- * result.attachment will be null.
- */
-export async function decryptContentAndAttachment(
-  base64Ciphertext, base64Iv, base64Key, attachmentCiphertext, attachmentIv
-) {
-  const key = await importKey(base64Key);
-  const plaintext = await decrypt(key, base64Ciphertext, base64Iv);
-
-  let attachment = null;
-  if (attachmentCiphertext && attachmentIv) {
-    const attachmentJson = await decrypt(key, attachmentCiphertext, attachmentIv);
-    attachment = parseAttachmentPlaintext(attachmentJson);
-  }
-
-  return { plaintext, attachment };
-}
-
-/**
- * PIN flow: decrypt text and (optionally) an attachment using the same
- * PIN-derived key (derived once, reused for both).
- */
-export async function decryptContentAndAttachmentWithPin(
-  base64Ciphertext, base64Iv, fragmentKeyB64, pin, saltB64, attachmentCiphertext, attachmentIv
-) {
-  const key = await derivePinContentKey(fragmentKeyB64, pin, saltB64);
-  const plaintext = await decrypt(key, base64Ciphertext, base64Iv);
-
-  let attachment = null;
-  if (attachmentCiphertext && attachmentIv) {
-    const attachmentJson = await decrypt(key, attachmentCiphertext, attachmentIv);
-    attachment = parseAttachmentPlaintext(attachmentJson);
-  }
-
-  return { plaintext, attachment };
 }
