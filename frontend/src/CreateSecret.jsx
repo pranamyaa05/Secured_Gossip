@@ -4,13 +4,14 @@ import {
   encryptContentWithPin,
   generateFragmentKey,
   wrapKeyWithPassphrase,
-  getMasterSecret,
-  getKeyVersion,
-  hkdf,
   encrypt,
   importKey,
-  generateKey
+  generateKey,
+  buildAttachmentPlaintext,
+  MAX_ATTACHMENT_BYTES,
+  ALLOWED_ATTACHMENT_EXTENSIONS,
 } from './crypto.js';
+import gossipImage from './assets/gossip.png';
 
 const API_BASE = 'http://localhost:3001';
 
@@ -25,6 +26,65 @@ function formatStatus(status) {
     default: return status;
   }
 }
+function statusClass(status) { return `status-pill status-${status}`; }
+
+function WaveField({ className }) {
+  return (
+    <svg viewBox="0 0 1440 300" preserveAspectRatio="none" className={className} aria-hidden="true">
+      <path d="M0,180 C240,120 480,220 720,170 C960,120 1200,200 1440,150 L1440,300 L0,300 Z" fill="var(--mint)" opacity="0.18" />
+      <path d="M0,210 C240,260 480,180 720,220 C960,260 1200,190 1440,230 L1440,300 L0,300 Z" fill="var(--lavender)" opacity="0.16" />
+      <path d="M0,240 C240,200 480,270 720,230 C960,190 1200,260 1440,220 L1440,300 L0,300 Z" fill="var(--peach)" opacity="0.16" />
+    </svg>
+  );
+}
+
+function GossipIllustration() {
+  return (
+    <img
+      src={gossipImage}
+      alt="Two people whispering secrets"
+      className="gossip-illustration"
+    />
+  );
+}
+
+function SealMark() {
+  return (
+    <svg viewBox="0 0 120 120" className="seal-wrap" role="img" aria-label="A sealed spiral mark">
+      <path d="M60,20 C90,20 100,50 85,70 C73,86 48,86 40,68 C34,54 44,42 58,44 C68,46 72,56 64,60"
+        fill="none" stroke="var(--ink-line)" strokeWidth="3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function PrivacyDiagram() {
+  return (
+    <div className="privacy-diagram">
+      <div className="privacy-node">
+        <svg viewBox="0 0 100 70" className="privacy-node-svg" aria-hidden="true">
+          <rect x="6" y="6" width="88" height="58" rx="10" fill="none" stroke="var(--ink-line)" strokeWidth="2" />
+        </svg>
+        <span>Your device</span>
+      </div>
+      <svg viewBox="0 0 80 20" className="privacy-line" aria-hidden="true">
+        <line x1="0" y1="10" x2="80" y2="10" stroke="var(--mint-deep)" strokeWidth="3" strokeLinecap="round" />
+      </svg>
+      <div className="privacy-node privacy-node-seal"><SealMark /></div>
+      <svg viewBox="0 0 80 20" className="privacy-line" aria-hidden="true">
+        <line x1="0" y1="10" x2="80" y2="10" stroke="var(--ink-muted)" strokeWidth="2" strokeDasharray="4 6" strokeLinecap="round" />
+      </svg>
+      <div className="privacy-node">
+        <svg viewBox="0 0 100 70" className="privacy-node-svg" aria-hidden="true">
+          <rect x="6" y="6" width="88" height="58" rx="10" fill="none" stroke="var(--ink-line)" strokeWidth="2" />
+          <line x1="20" y1="24" x2="80" y2="24" stroke="var(--ink-line)" strokeWidth="2" />
+          <line x1="20" y1="38" x2="80" y2="38" stroke="var(--ink-line)" strokeWidth="2" />
+          <line x1="20" y1="52" x2="60" y2="52" stroke="var(--ink-line)" strokeWidth="2" />
+        </svg>
+        <span>Our server — sees only ciphertext</span>
+      </div>
+    </div>
+  );
+}
 
 function CreateSecret() {
   const [text, setText] = useState('');
@@ -37,20 +97,44 @@ function CreateSecret() {
   const [notBefore, setNotBefore] = useState('');
   const [notAfter, setNotAfter] = useState('');
 
+  const [file, setFile] = useState(null);
+  const [fileError, setFileError] = useState('');
+  const [fileInputKey, setFileInputKey] = useState(0);
+
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   const [activeSecret, setActiveSecret] = useState(null);
   const [statusLoading, setStatusLoading] = useState(false);
   const [revokeLoading, setRevokeLoading] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  function handleFileChange(e) {
+    const selected = e.target.files && e.target.files[0];
+    setFileError('');
+    if (!selected) { setFile(null); return; }
+    if (selected.size > MAX_ATTACHMENT_BYTES) {
+      setFileError(`File exceeds the ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB limit.`);
+      setFile(null);
+      return;
+    }
+    const lastDot = selected.name.lastIndexOf('.');
+    const ext = lastDot >= 0 ? selected.name.slice(lastDot).toLowerCase() : '';
+    if (!ALLOWED_ATTACHMENT_EXTENSIONS.includes(ext)) {
+      setFileError('Unsupported file type for this demo.');
+      setFile(null);
+      return;
+    }
+    setFile(selected);
+  }
 
   async function handleSubmit(e) {
     e.preventDefault();
     setError('');
     setActiveSecret(null);
 
-    if (!text.trim()) {
-      setError('Please enter some content to encrypt.');
+    if (!text.trim() && !file) {
+      setError('Please enter some content or attach a file to encrypt.');
       return;
     }
 
@@ -66,7 +150,6 @@ function CreateSecret() {
         return;
       }
 
-      // Check for duplicate recipient IDs
       const recipientIds = validRecipients.map(r => r.id.trim());
       const uniqueIds = new Set(recipientIds);
       if (uniqueIds.size !== recipientIds.length) {
@@ -77,29 +160,41 @@ function CreateSecret() {
 
     setSubmitting(true);
     try {
-      // Convert datetime-local strings to timestamps (milliseconds) for backend
       const notBeforeTimestamp = notBefore ? new Date(notBefore).getTime() : null;
       const notAfterTimestamp = notAfter ? new Date(notAfter).getTime() : null;
       let payload;
       let urlFragmentKey;
 
       if (enablePin) {
-        const { ciphertext, iv, fragmentKey, salt } = await encryptContentWithPin(text, pin);
-        payload = { ciphertext, iv, expiresInSeconds, burnAfterRead, pin, contentSalt: salt };
-        urlFragmentKey = fragmentKey;
+        const encryptedData = await encryptContentWithPin(text, pin, file);
+        payload = {
+          ciphertext: encryptedData.ciphertext,
+          iv: encryptedData.iv,
+          expiresInSeconds,
+          burnAfterRead,
+          pin,
+          contentSalt: encryptedData.salt,
+          attachmentCiphertext: encryptedData.attachmentCiphertext,
+          attachmentIv: encryptedData.attachmentIv
+        };
+        urlFragmentKey = encryptedData.fragmentKey;
       } else if (mode === 'multiple') {
-        // Multi-recipient mode: envelope encryption
-        // 1. Generate a random DEK (Data Encryption Key)
         const { raw: dekRaw } = await generateKey();
         const dek = await importKey(dekRaw);
-
-        // 2. Encrypt the secret with the DEK
         const { ciphertext, iv } = await encrypt(dek, text);
 
-        // 3. For each recipient, encrypt the DEK with their passphrase
+        let attachmentCiphertext = null;
+        let attachmentIv = null;
+        if (file) {
+          const attachmentPlaintext = await buildAttachmentPlaintext(file);
+          const attEncrypted = await encrypt(dek, attachmentPlaintext);
+          attachmentCiphertext = attEncrypted.ciphertext;
+          attachmentIv = attEncrypted.iv;
+        }
+
         const keyEnvelopes = await Promise.all(
-          validRecipients.map(async (recipient) => {
-            const { encryptedKey, salt, iv } = await wrapKeyWithPassphrase(
+          recipients.filter(r => r.id.trim() && r.passphrase.trim()).map(async (recipient) => {
+            const { encryptedKey, salt, iv: wrapIv } = await wrapKeyWithPassphrase(
               await crypto.subtle.exportKey('raw', dek),
               recipient.passphrase.trim()
             );
@@ -107,7 +202,7 @@ function CreateSecret() {
               recipientId: recipient.id.trim(),
               encryptedKey,
               salt,
-              iv
+              iv: wrapIv
             };
           })
         );
@@ -118,22 +213,25 @@ function CreateSecret() {
           expiresInSeconds,
           burnAfterRead,
           keyEnvelopes,
-          isMulti: true
+          isMulti: true,
+          attachmentCiphertext,
+          attachmentIv
         };
-        // For multi-recipient, we use a random fragment key that's not used for encryption
         urlFragmentKey = generateFragmentKey();
       } else {
-        // Single recipient mode (existing logic)
-        const { ciphertext, iv, key, version } = await encryptContent(text);
-        payload = { ciphertext, iv, expiresInSeconds, burnAfterRead, version };
-        // Add time constraints if provided
-        if (notBeforeTimestamp !== null) {
-          payload.notBefore = notBeforeTimestamp;
-        }
-        if (notAfterTimestamp !== null) {
-          payload.notAfter = notAfterTimestamp;
-        }
-        urlFragmentKey = key;
+        const encryptedData = await encryptContent(text, file);
+        payload = {
+          ciphertext: encryptedData.ciphertext,
+          iv: encryptedData.iv,
+          expiresInSeconds,
+          burnAfterRead,
+          version: encryptedData.version,
+          attachmentCiphertext: encryptedData.attachmentCiphertext,
+          attachmentIv: encryptedData.attachmentIv
+        };
+        if (notBeforeTimestamp !== null) payload.notBefore = notBeforeTimestamp;
+        if (notAfterTimestamp !== null) payload.notAfter = notAfterTimestamp;
+        urlFragmentKey = encryptedData.key;
       }
 
       const response = await fetch(`${API_BASE}/pastes`, {
@@ -142,12 +240,11 @@ function CreateSecret() {
         body: JSON.stringify(payload),
       });
 
-      if (!response.ok) {
-        throw new Error(`Server returned ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`Server returned ${response.status}`);
 
       const { id, deleteToken, version } = await response.json();
-      const url = `${window.location.origin}/#/view/${id}?v=${version}#${urlFragmentKey}`;
+      const versionQuery = version ? `?v=${version}` : '';
+      const url = `${window.location.origin}/#/view/${id}${versionQuery}#${urlFragmentKey}`;
 
       setActiveSecret({
         id,
@@ -160,9 +257,12 @@ function CreateSecret() {
       setText('');
       setPin('');
       setEnablePin(false);
-      if (mode === 'multiple') {
-        setRecipients([{ id: '', passphrase: '' }]); // Reset recipients
-      }
+      setNotBefore('');
+      setNotAfter('');
+      setFile(null);
+      setFileError('');
+      setFileInputKey(k => k + 1);
+      if (mode === 'multiple') setRecipients([{ id: '', passphrase: '' }]);
     } catch (err) {
       console.error('Error creating secret:', err);
       setError('Failed to create secret. Please try again.');
@@ -181,12 +281,8 @@ function CreateSecret() {
       if (res.ok) {
         const data = await res.json();
         setActiveSecret(prev => ({ ...prev, status: data.status, viewedAt: data.viewedAt }));
-      } else {
-        // If the server returns a 404, it means the secret is gone entirely.
-        // During dev, this usually means the Node.js server restarted and wiped the in-memory Maps.
-        if (res.status === 404) {
-           setActiveSecret(prev => ({ ...prev, status: 'not_found' }));
-        }
+      } else if (res.status === 404) {
+        setActiveSecret(prev => ({ ...prev, status: 'not_found' }));
       }
     } catch (err) {
       console.error('Failed to fetch status', err);
@@ -206,297 +302,281 @@ function CreateSecret() {
       if (res.ok || res.status === 404) {
         setActiveSecret(prev => ({ ...prev, status: 'revoked' }));
       }
-    } catch(err) {
+    } catch (err) {
       console.error('Failed to revoke', err);
     } finally {
       setRevokeLoading(false);
     }
   }
 
+  async function copyLink() {
+    if (!activeSecret) return;
+    try {
+      await navigator.clipboard.writeText(activeSecret.link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (err) {
+      // Clipboard fallback
+    }
+  }
+
+  function openRecipientView() {
+    if (!activeSecret) return;
+    window.open(activeSecret.link, '_blank', 'noopener');
+  }
+
   return (
-    <main>
-      <h1>Secured_Gossip</h1>
-      
-      {!activeSecret ? (
-        <form onSubmit={handleSubmit}>
-          <div>
-            <div style={{ marginBottom: '1rem' }}>
-              <label>
-                Mode:{' '}
-                <select
-                  value={mode}
-                  onChange={(e) => setMode(e.target.value)}
-                >
+    <div className="page-shell">
+      <header className="page-header"><span className="wordmark">Secured_Gossip</span></header>
+
+      <section className="create-hero">
+        <h1>Some things stay between two people.</h1>
+        <p className="create-hero-sub">Write your secret below. It&rsquo;s encrypted on your device before anything is sent anywhere.</p>
+        <div className="create-hero-rule" />
+      </section>
+
+      <div className="create-main">
+        <div className="illustration-zone">
+          <WaveField className="illustration-wave" />
+          <GossipIllustration />
+          <div className="illustration-copy">
+            <p className="illustration-caption-lead">Gossip is human.</p>
+            <p className="illustration-caption">Privacy should be too.</p>
+            <p className="illustration-body">Some things are meant to be shared. Some are meant to stay between two people.</p>
+          </div>
+        </div>
+
+        {!activeSecret ? (
+          <div className="form-zone">
+            <form onSubmit={handleSubmit}>
+              <div className="field field-inline">
+                <span className="eyebrow" style={{ marginBottom: 0 }}>Mode</span>
+                <select className="field-select" value={mode} onChange={(e) => setMode(e.target.value)}>
                   <option value="single">Single Recipient</option>
                   <option value="multiple">Multiple Recipients</option>
                 </select>
-              </label>
-            </div>
+              </div>
 
-            {mode === 'single' && (
-              <>
-                <div>
-                  <textarea
-                    value={text}
-                    onChange={(e) => setText(e.target.value)}
-                    placeholder="Type your secret here..."
-                    rows={8}
-                    cols={50}
-                  />
-                </div>
+              <div className="field">
+                <span className="eyebrow">Your secret</span>
+                <textarea
+                  className="field-textarea"
+                  value={text}
+                  onChange={(e) => setText(e.target.value)}
+                  placeholder="Type your secret here…"
+                />
+              </div>
 
-                <div style={{ margin: '1rem 0' }}>
-                  <label>
-                    Expiry:{' '}
-                    <select
-                      value={expiresInSeconds}
-                      onChange={(e) => setExpiresInSeconds(Number(e.target.value))}
-                    >
-                      <option value={300}>5 minutes</option>
-                      <option value={3600}>1 hour</option>
-                      <option value={86400}>1 day</option>
-                    </select>
-                  </label>
-                </div>
+              <div className="field">
+                <span className="eyebrow">Attach a file (optional, up to 5MB)</span>
+                <input
+                  key={fileInputKey}
+                  type="file"
+                  className="field-file-input"
+                  accept={ALLOWED_ATTACHMENT_EXTENSIONS.join(',')}
+                  onChange={handleFileChange}
+                />
+                {file && (
+                  <p className="file-selected-info">
+                    Selected: <strong>{file.name}</strong> ({Math.round(file.size / 1024)} KB)
+                  </p>
+                )}
+                {fileError && <p className="error-text">{fileError}</p>}
+              </div>
 
-                <div style={{ margin: '1rem 0' }}>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={burnAfterRead}
-                      onChange={(e) => setBurnAfterRead(e.target.checked)}
-                    />{' '}
-                    Burn after read
-                  </label>
-                </div>
+              <div className="field field-inline">
+                <span className="eyebrow" style={{ marginBottom: 0 }}>Expires</span>
+                <select className="field-select" value={expiresInSeconds} onChange={(e) => setExpiresInSeconds(Number(e.target.value))}>
+                  <option value={300}>5 minutes</option>
+                  <option value={3600}>1 hour</option>
+                  <option value={86400}>1 day</option>
+                </select>
+              </div>
 
-                <div style={{ margin: '1rem 0' }}>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={enablePin}
-                      onChange={(e) => setEnablePin(e.target.checked)}
-                    />{' '}
-                    Require a PIN to unlock
-                  </label>
-                </div>
+              <div className="field">
+                <label className="field-checkbox">
+                  Burn after read
+                  <input type="checkbox" checked={burnAfterRead} onChange={(e) => setBurnAfterRead(e.target.checked)} />
+                </label>
+              </div>
 
-                {enablePin && (
-                  <div style={{ margin: '1rem 0' }}>
-                    <label>
-                      PIN:{' '}
-                      <input
-                        type="password"
-                        value={pin}
-                        onChange={(e) => setPin(e.target.value)}
-                        placeholder="4-32 characters"
-                        minLength={4}
-                        maxLength={32}
-                      />
+              {mode === 'single' && (
+                <>
+                  <div className="field">
+                    <label className="field-checkbox">
+                      Require a PIN to unlock
+                      <input type="checkbox" checked={enablePin} onChange={(e) => setEnablePin(e.target.checked)} />
                     </label>
                   </div>
-                )}
 
-                {/* Time-based access controls */}
-                <div style={{ margin: '1.5rem 0' }}>
-                  <h4>Access Schedule</h4>
-                  <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
-                    <div>
-                      <label>
-                        Available from:{' '}
+                  {enablePin && (
+                    <div className="field">
+                      <span className="eyebrow">PIN (4–32 characters)</span>
+                      <input
+                        type="password" className="field-input" value={pin}
+                        onChange={(e) => setPin(e.target.value)} minLength={4} maxLength={32}
+                      />
+                    </div>
+                  )}
+
+                  <div className="field">
+                    <span className="eyebrow">Access Schedule (Optional)</span>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '0.5rem' }}>
+                      <div>
+                        <span style={{ fontSize: '0.85rem', color: 'var(--ink-muted)' }}>Available from:</span>
                         <input
-                          type="datetime-local"
-                          value={notBefore}
+                          type="datetime-local" className="field-input" value={notBefore}
                           onChange={(e) => setNotBefore(e.target.value)}
                         />
-                      </label>
-                    </div>
-                    <div>
-                      <label>
-                        Available until:{' '}
+                      </div>
+                      <div>
+                        <span style={{ fontSize: '0.85rem', color: 'var(--ink-muted)' }}>Available until:</span>
                         <input
-                          type="datetime-local"
-                          value={notAfter}
+                          type="datetime-local" className="field-input" value={notAfter}
                           onChange={(e) => setNotAfter(e.target.value)}
                         />
-                      </label>
+                      </div>
                     </div>
                   </div>
-                  <small style={{ display: 'block', marginTop: '0.5rem', color: '#666' }}>
-                    Leave blank for immediate availability and no time-based expiration
-                  </small>
-                </div>
-              </>
-            )}
+                </>
+              )}
 
-            {mode === 'multiple' && (
-              <>
-                <div>
-                  <textarea
-                    value={text}
-                    onChange={(e) => setText(e.target.value)}
-                    placeholder="Type your secret here..."
-                    rows={8}
-                    cols={50}
-                  />
-                </div>
-
-                <div style={{ margin: '1rem 0' }}>
-                  <label>
-                    Expiry:{' '}
-                    <select
-                      value={expiresInSeconds}
-                      onChange={(e) => setExpiresInSeconds(Number(e.target.value))}
-                    >
-                      <option value={300}>5 minutes</option>
-                      <option value={3600}>1 hour</option>
-                      <option value={86400}>1 day</option>
-                    </select>
-                  </label>
-                </div>
-
-                <div style={{ margin: '1rem 0' }}>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={burnAfterRead}
-                      onChange={(e) => setBurnAfterRead(e.target.checked)}
-                    />{' '}
-                    Burn after read
-                  </label>
-                </div>
-
-                <div style={{ margin: '1.5rem 0' }}>
-                  <h4>Recipients</h4>
+              {mode === 'multiple' && (
+                <div className="field">
+                  <span className="eyebrow">Recipients &amp; Passphrases</span>
                   {recipients.map((recipient, index) => (
-                    <div key={index} style={{ display: 'flex', gap: '1rem', alignItems: 'end', marginBottom: '0.5rem' }}>
-                      <div style={{ flex: 1 }}>
-                        <label>
-                          Recipient ID:{' '}
-                          <input
-                            value={recipient.id}
-                            onChange={(e) => {
-                              const newRecipients = [...recipients];
-                              newRecipients[index] = { ...newRecipients[index], id: e.target.value };
-                              setRecipients(newRecipients);
-                            }}
-                            placeholder="e.g., alice@example.com"
-                          />
-                        </label>
-                      </div>
-                      <div style={{ flex: 1 }}>
-                        <label>
-                          Passphrase:{' '}
-                          <input
-                            type="password"
-                            value={recipient.passphrase}
-                            onChange={(e) => {
-                              const newRecipients = [...recipients];
-                              newRecipients[index] = { ...newRecipients[index], passphrase: e.target.value };
-                              setRecipients(newRecipients);
-                            }}
-                            placeholder="Enter passphrase"
-                          />
-                        </label>
-                      </div>
+                    <div key={index} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: '0.8rem', alignItems: 'center', marginBottom: '0.8rem' }}>
+                      <input
+                        className="field-input"
+                        value={recipient.id}
+                        onChange={(e) => {
+                          const updated = [...recipients];
+                          updated[index] = { ...updated[index], id: e.target.value };
+                          setRecipients(updated);
+                        }}
+                        placeholder="Recipient ID (e.g. Alice)"
+                      />
+                      <input
+                        type="password"
+                        className="field-input"
+                        value={recipient.passphrase}
+                        onChange={(e) => {
+                          const updated = [...recipients];
+                          updated[index] = { ...updated[index], passphrase: e.target.value };
+                          setRecipients(updated);
+                        }}
+                        placeholder="Passphrase"
+                      />
                       {recipients.length > 1 && (
                         <button
-                          onClick={() => {
-                            const newRecipients = recipients.filter((_, i) => i !== index);
-                            setRecipients(newRecipients);
-                          }}
-                          style={{
-                            backgroundColor: '#ff4444',
-                            color: 'white',
-                            border: 'none',
-                            padding: '0.25rem 0.5rem',
-                            borderRadius: '4px',
-                            cursor: 'pointer'
-                          }}
+                          type="button"
+                          className="btn btn-danger-light"
+                          style={{ padding: '0.4rem 0.8rem', fontSize: '0.85rem' }}
+                          onClick={() => setRecipients(recipients.filter((_, i) => i !== index))}
                         >
-                          Remove
+                          ✕
                         </button>
                       )}
                     </div>
                   ))}
-                  <div style={{ marginTop: '0.5rem' }}>
-                    <button
-                      onClick={() => setRecipients([...recipients, { id: '', passphrase: '' }])}
-                      style={{
-                        backgroundColor: '#444',
-                        color: 'white',
-                        border: 'none',
-                        padding: '0.25rem 0.5rem',
-                        borderRadius: '4px',
-                        cursor: 'pointer'
-                      }}
-                    >
-                      Add Recipient
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-secondary-light"
+                    style={{ padding: '0.5rem 1rem', fontSize: '0.85rem', marginTop: '0.5rem' }}
+                    onClick={() => setRecipients([...recipients, { id: '', passphrase: '' }])}
+                  >
+                    + Add Recipient
+                  </button>
                 </div>
-              </>
-            )}
+              )}
 
-            <div style={{ margin: '1rem 0' }}>
-              <button type="submit" disabled={submitting}>
-                {submitting ? 'Encrypting...' : 'Create Secret'}
+              <button type="submit" className="btn btn-primary-light btn-block" disabled={submitting} style={{ marginTop: '1rem' }}>
+                {submitting ? 'Encrypting…' : 'Create Secret'}
+              </button>
+              {error && <p className="error-text">{error}</p>}
+            </form>
+          </div>
+        ) : (
+          <div className="status-zone">
+            <h3>Secret created</h3>
+            <p className="muted-text">This link only works once opened — the key never touches our server.</p>
+
+            <div className="status-link-row">
+              <input
+                type="text" readOnly value={activeSecret.link}
+                className="status-link-input" onFocus={(e) => e.target.select()}
+              />
+              <button className="btn btn-secondary-light" onClick={copyLink} type="button">
+                {copied ? 'Copied' : 'Copy Link'}
               </button>
             </div>
-          </div>
-        </form>
-      ) : (
-        <div style={{ textAlign: 'left' }}>
-          <h3>Secret created successfully.</h3>
-          <p>Share this link (it will only work once you open it — the key is never sent to the server):</p>
-          <input
-            type="text"
-            readOnly
-            value={activeSecret.link}
-            style={{ width: '100%', padding: '0.5rem', boxSizing: 'border-box' }}
-            onFocus={(e) => e.target.select()}
-          />
 
-          {/* ADDED: color: '#111' to ensure text is visible on the light gray background */}
-          <div style={{ marginTop: '1.5rem', padding: '1rem', background: '#f5f5f5', color: '#111', borderRadius: '4px' }}>
-            <p style={{ margin: '0 0 0.5rem 0' }}>
-              <strong>Status:</strong> {formatStatus(activeSecret.status)}
-            </p>
+            <div className="status-row">
+              <span className={statusClass(activeSecret.status)}>{formatStatus(activeSecret.status)}</span>
+            </div>
             {activeSecret.viewedAt && (
-              <p style={{ margin: '0 0 1rem 0' }}>
-                <strong>Seen at:</strong> {new Date(activeSecret.viewedAt).toLocaleString()}
+              <p className="status-viewed-at">Seen at {new Date(activeSecret.viewedAt).toLocaleString()}</p>
+            )}
+
+            <div className="status-actions">
+              <button className="btn btn-secondary-light" onClick={checkStatus} disabled={statusLoading} type="button">
+                {statusLoading ? 'Checking…' : 'Check Status'}
+              </button>
+              <button
+                className="btn btn-danger-light" onClick={revokeSecret}
+                disabled={revokeLoading || activeSecret.status !== 'waiting'} type="button"
+              >
+                {revokeLoading ? 'Revoking…' : 'Revoke Secret'}
+              </button>
+              <button className="btn btn-secondary-light" onClick={openRecipientView} type="button">
+                Open Recipient View
+              </button>
+            </div>
+            {burnAfterRead && activeSecret.status === 'waiting' && (
+              <p className="recipient-view-note">
+                This secret is burn-after-read — opening it here will use its one view.
               </p>
             )}
 
-            <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
-              <button onClick={checkStatus} disabled={statusLoading}>
-                {statusLoading ? 'Checking...' : 'Check Status'}
-              </button>
-              <button
-                onClick={revokeSecret}
-                disabled={revokeLoading || activeSecret.status !== 'waiting'}
-                style={{
-                  backgroundColor: activeSecret.status === 'waiting' ? '#ff4444' : '#ccc',
-                  color: 'white',
-                  border: 'none',
-                  padding: '0.5rem 1rem',
-                  borderRadius: '4px',
-                  cursor: activeSecret.status === 'waiting' ? 'pointer' : 'not-allowed'
-                }}
-              >
-                {revokeLoading ? 'Revoking...' : 'Revoke Secret'}
+            <div className="status-footer">
+              <button className="btn btn-secondary-light" onClick={() => setActiveSecret(null)} type="button">
+                Create Another Secret
               </button>
             </div>
           </div>
+        )}
+      </div>
 
-          <div style={{ marginTop: '2rem' }}>
-             <button onClick={() => setActiveSecret(null)}>Create Another Secret</button>
+      <section className="privacy-section">
+        <h2>Your secret stays yours.</h2>
+        <p>
+          Everything is encrypted on your device before it&rsquo;s sent anywhere. Our server only
+          ever stores that scrambled version — never your message, never your key.
+        </p>
+        <PrivacyDiagram />
+      </section>
+
+      <section id="how-it-works" className="how-it-works">
+        <h2>How Secured_Gossip works</h2>
+        <div className="how-it-works-row">
+          <div className="how-step">
+            <span className="how-step-ghost">01</span>
+            <h3>Write</h3>
+            <p>Enter your secret, configure recipients, or attach a file.</p>
+          </div>
+          <div className="how-step">
+            <span className="how-step-ghost">02</span>
+            <h3>Encrypt</h3>
+            <p>Your content is encrypted on your device before it leaves your device.</p>
+          </div>
+          <div className="how-step">
+            <span className="how-step-ghost">03</span>
+            <h3>Share</h3>
+            <p>Send the link. The recipient unlocks it with their passphrase or PIN.</p>
           </div>
         </div>
-      )}
-
-      {error && <p style={{ color: 'red', marginTop: '1rem' }}>{error}</p>}
-    </main>
+      </section>
+    </div>
   );
 }
 

@@ -5,7 +5,6 @@ import crypto from "node:crypto";
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ---- Config ----
 const PIN_ITERATIONS = 300000;
 const PIN_KEYLEN = 32;
 const PIN_DIGEST = "sha256";
@@ -13,15 +12,11 @@ const MAX_PIN_ATTEMPTS = 5;
 const REVEAL_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const REVEAL_RATE_LIMIT_MAX = 30;
 
-// In-memory store for ciphertext and crypto parameters.
 const pastes = new Map();
-
-// In-memory store for creator status tracking.
-// id -> { deleteTokenHash, status, createdAt, expiresInSeconds, viewedAt, notBefore, notAfter }
 const pasteStatus = new Map();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "15mb" }));
 
 const revealHits = new Map();
 function isRateLimited(ip) {
@@ -37,22 +32,9 @@ function isRateLimited(ip) {
 
 function isExpired(pasteOrMeta) {
   const now = Date.now();
-
-  // Check standard expiration (createdAt + expiresInSeconds)
-  if (now > pasteOrMeta.createdAt + pasteOrMeta.expiresInSeconds * 1000) {
-    return true;
-  }
-
-  // Check notBefore (if secret is not yet available)
-  if (pasteOrMeta.notBefore !== null && pasteOrMeta.notBefore !== undefined && now < pasteOrMeta.notBefore) {
-    return true;
-  }
-
-  // Check notAfter (if secret has expired based on time window)
-  if (pasteOrMeta.notAfter !== null && pasteOrMeta.notAfter !== undefined && now > pasteOrMeta.notAfter) {
-    return true;
-  }
-
+  if (now > pasteOrMeta.createdAt + pasteOrMeta.expiresInSeconds * 1000) return true;
+  if (pasteOrMeta.notBefore !== null && pasteOrMeta.notBefore !== undefined && now < pasteOrMeta.notBefore) return true;
+  if (pasteOrMeta.notAfter !== null && pasteOrMeta.notAfter !== undefined && now > pasteOrMeta.notAfter) return true;
   return false;
 }
 
@@ -80,14 +62,15 @@ app.post("/pastes", (req, res) => {
     keyEnvelopes,
     isMulti,
     notBefore,
-    notAfter
+    notAfter,
+    attachmentCiphertext,
+    attachmentIv
   } = req.body || {};
 
   if (typeof ciphertext !== "string" || typeof iv !== "string" || !ciphertext || !iv) {
     return res.status(400).json({ error: "ciphertext and iv are required strings" });
   }
 
-  // Validate time constraints
   const now = Date.now();
   let validNotBefore = null;
   let validNotAfter = null;
@@ -147,7 +130,9 @@ app.post("/pastes", (req, res) => {
     keyEnvelopes: Array.isArray(keyEnvelopes) ? keyEnvelopes : [],
     isMulti: Boolean(isMulti),
     notBefore: validNotBefore,
-    notAfter: validNotAfter
+    notAfter: validNotAfter,
+    attachmentCiphertext: attachmentCiphertext || null,
+    attachmentIv: attachmentIv || null
   });
 
   pasteStatus.set(id, {
@@ -163,7 +148,6 @@ app.post("/pastes", (req, res) => {
   res.status(201).json({ id, deleteToken, version: Number(version) || 0 });
 });
 
-// Recipient endpoint to check metadata before entering PIN/passphrase
 app.get("/pastes/:id/meta", (req, res) => {
   const { id } = req.params;
   const paste = pastes.get(id);
@@ -182,6 +166,7 @@ app.get("/pastes/:id/meta", (req, res) => {
 
   res.json({
     hasPin: paste.hasPin,
+    hasAttachment: Boolean(paste.attachmentCiphertext),
     version: paste.version,
     isMulti: paste.isMulti,
     notBefore: meta.notBefore,
@@ -189,7 +174,6 @@ app.get("/pastes/:id/meta", (req, res) => {
   });
 });
 
-// Creator-authorized endpoint to check status
 app.get("/pastes/:id/status", (req, res) => {
   const { id } = req.params;
   const token = req.get("x-delete-token");
@@ -239,7 +223,6 @@ app.post("/pastes/:id/reveal", (req, res) => {
     return res.status(404).json({ error: "not found or not currently available" });
   }
 
-  // Handle single-recipient mode
   if (!paste.isMulti) {
     if (paste.hasPin) {
       if (typeof pin !== "string" || !pin) {
@@ -265,7 +248,13 @@ app.post("/pastes/:id/reveal", (req, res) => {
       }
     }
 
-    const payload = { ciphertext: paste.ciphertext, iv: paste.iv };
+    const payload = {
+      ciphertext: paste.ciphertext,
+      iv: paste.iv,
+      version: paste.version,
+      attachmentCiphertext: paste.attachmentCiphertext,
+      attachmentIv: paste.attachmentIv
+    };
     if (paste.hasPin) payload.contentSalt = paste.contentSalt;
 
     if (meta) {
@@ -282,7 +271,6 @@ app.post("/pastes/:id/reveal", (req, res) => {
     return res.json(payload);
   }
 
-  // Handle multi-recipient mode
   if (typeof recipientId !== "string" || !recipientId) {
     return res.status(400).json({ error: "recipientId is required" });
   }
@@ -304,6 +292,9 @@ app.post("/pastes/:id/reveal", (req, res) => {
   return res.json({
     ciphertext: paste.ciphertext,
     iv: paste.iv,
+    version: paste.version,
+    attachmentCiphertext: paste.attachmentCiphertext,
+    attachmentIv: paste.attachmentIv,
     keyEnvelope: {
       encryptedKey: envelope.encryptedKey,
       salt: envelope.salt,

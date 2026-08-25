@@ -1,24 +1,25 @@
 import { useEffect, useRef, useState } from 'react';
-import { decryptContent, decryptContentWithPin, decrypt, getMasterSecret, hkdf, arrayBufferToBase64Url, base64UrlToArrayBuffer, unwrapKeyWithPassphrase } from './crypto.js';
+import {
+  decryptContent,
+  decryptContentWithPin,
+  decrypt,
+  unwrapKeyWithPassphrase,
+  parseAttachmentPlaintext
+} from './crypto.js';
 
 const API_BASE = 'http://localhost:3001';
 
-/**
- * Parses the current URL into paste id, version, and decryption key.
- * Expected shape: #/view/{id}?v={version}#{base64url key}
- */
-function parseViewHash(hash) {
-  const withoutLeadingHash = hash.replace(/^#/, '');
-  const secondHashIndex = withoutLeadingHash.indexOf('#');
+function parseViewHash(rawHash) {
+  const hash = rawHash.replace(/^#/, '');
+  const secondHashIndex = hash.indexOf('#');
 
   if (secondHashIndex === -1) {
     return { id: null, key: null, version: null };
   }
 
-  const routePart = withoutLeadingHash.slice(0, secondHashIndex);
-  const key = withoutLeadingHash.slice(secondHashIndex + 1);
+  const routePart = hash.slice(0, secondHashIndex);
+  const key = hash.slice(secondHashIndex + 1);
 
-  // Extract version from query string in routePart
   const queryIndex = routePart.indexOf('?');
   let version = null;
   let pathPart = routePart;
@@ -35,12 +36,33 @@ function parseViewHash(hash) {
   return { id, key, version };
 }
 
+function WaveField({ className }) {
+  return (
+    <svg viewBox="0 0 1440 300" preserveAspectRatio="none" className={className} aria-hidden="true">
+      <path d="M0,180 C240,120 480,220 720,170 C960,120 1200,200 1440,150 L1440,300 L0,300 Z" fill="var(--sky)" opacity="0.16" />
+      <path d="M0,210 C240,260 480,180 720,220 C960,260 1200,190 1440,230 L1440,300 L0,300 Z" fill="var(--lavender)" opacity="0.16" />
+      <path d="M0,240 C240,200 480,270 720,230 C960,190 1200,260 1440,220 L1440,300 L0,300 Z" fill="var(--mint)" opacity="0.15" />
+    </svg>
+  );
+}
+
+function SealMark() {
+  return (
+    <svg viewBox="0 0 120 120" className="seal-wrap" role="img" aria-label="A sealed spiral mark">
+      <path d="M60,20 C90,20 100,50 85,70 C73,86 48,86 40,68 C34,54 44,42 58,44 C68,46 72,56 64,60"
+        fill="none" stroke="var(--ink-line)" strokeWidth="3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function ViewSecret() {
-  const [status, setStatus] = useState('loading_meta'); // loading_meta | ready | revealing | success | error
+  const [status, setStatus] = useState('loading_meta');
   const [metaInfo, setMetaInfo] = useState({
     id: null,
     fragmentKey: null,
     hasPin: false,
+    hasAttachment: false,
+    version: null,
     isMulti: false,
     notBefore: null,
     notAfter: null
@@ -49,6 +71,7 @@ function ViewSecret() {
   const [recipientId, setRecipientId] = useState('');
   const [passphrase, setPassphrase] = useState('');
   const [plaintext, setPlaintext] = useState('');
+  const [attachment, setAttachment] = useState(null);
   const [errorMessage, setErrorMessage] = useState('');
   const hasFetchedRef = useRef(false);
 
@@ -56,7 +79,7 @@ function ViewSecret() {
     if (hasFetchedRef.current) return;
     hasFetchedRef.current = true;
 
-    const { id, key } = parseViewHash(window.location.hash);
+    const { id, key, version: parsedVersion } = parseViewHash(window.location.hash);
 
     if (!id || !key) {
       setStatus('error');
@@ -72,19 +95,18 @@ function ViewSecret() {
           throw new Error('not found');
         }
 
-        const { hasPin, version, isMulti, notBefore, notAfter } = await response.json();
+        const { hasPin, hasAttachment, version, isMulti, notBefore, notAfter } = await response.json();
 
-        // Check time-based constraints
         const now = Date.now();
-        if (notBefore !== null && now < notBefore) {
+        if (notBefore !== null && notBefore !== undefined && now < notBefore) {
           setStatus('error');
           setErrorMessage(`This secret is not yet available. Available from: ${new Date(notBefore).toLocaleString()}`);
           return;
         }
 
-        if (notAfter !== null && now > notAfter) {
+        if (notAfter !== null && notAfter !== undefined && now > notAfter) {
           setStatus('error');
-          setErrorMessage(`This secret is no longer available. Available until: ${new Date(notAfter).toLocaleString()}`);
+          setErrorMessage(`This secret is no longer available. Expired at: ${new Date(notAfter).toLocaleString()}`);
           return;
         }
 
@@ -92,10 +114,11 @@ function ViewSecret() {
           id,
           fragmentKey: key,
           hasPin,
-          version: Number(version),
+          hasAttachment: Boolean(hasAttachment),
+          version: version ?? parsedVersion,
           isMulti: Boolean(isMulti),
-          notBefore: notBefore !== null ? notBefore : null,
-          notAfter: notAfter !== null ? notAfter : null
+          notBefore: notBefore ?? null,
+          notAfter: notAfter ?? null
         });
         setStatus('ready');
       } catch (err) {
@@ -106,6 +129,12 @@ function ViewSecret() {
 
     fetchMeta();
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (attachment?.url) URL.revokeObjectURL(attachment.url);
+    };
+  }, [attachment]);
 
   async function handleReveal(e) {
     if (e) e.preventDefault();
@@ -142,30 +171,27 @@ function ViewSecret() {
         }
       }
 
-      let decrypted;
+      const resData = await response.json();
+      let decryptedResult = { plaintext: '', attachment: null };
+
       if (metaInfo.hasPin) {
-        // Single recipient with PIN (existing logic)
-        const { ciphertext, iv, contentSalt, version } = await response.json();
-        decrypted = await decryptContentWithPin(
-          ciphertext,
-          iv,
+        decryptedResult = await decryptContentWithPin(
+          resData.ciphertext,
+          resData.iv,
           metaInfo.fragmentKey,
           pinInput,
-          contentSalt
+          resData.contentSalt,
+          resData.attachmentCiphertext,
+          resData.attachmentIv
         );
       } else if (metaInfo.isMulti) {
-        // Multi-recipient mode: unwrap DEK then decrypt secret
-        const { ciphertext, iv, keyEnvelope } = await response.json();
-
-        // 1. Unwrap the DEK using the recipient's passphrase
         const dekRaw = await unwrapKeyWithPassphrase(
-          keyEnvelope.encryptedKey,
-          keyEnvelope.salt,
-          keyEnvelope.iv,
+          resData.keyEnvelope.encryptedKey,
+          resData.keyEnvelope.salt,
+          resData.keyEnvelope.iv,
           passphrase
         );
 
-        // 2. Import the unwrapped DEK
         const dekKey = await crypto.subtle.importKey(
           'raw',
           dekRaw,
@@ -174,30 +200,39 @@ function ViewSecret() {
           ['decrypt']
         );
 
-        // 3. Decrypt the secret with the DEK
-        decrypted = await decrypt(dekKey, ciphertext, iv);
+        const text = await decrypt(dekKey, resData.ciphertext, resData.iv);
+        let parsedAtt = null;
+        if (resData.attachmentCiphertext && resData.attachmentIv) {
+          const attJson = await decrypt(dekKey, resData.attachmentCiphertext, resData.attachmentIv);
+          parsedAtt = parseAttachmentPlaintext(attJson);
+        }
+        decryptedResult = { plaintext: text, attachment: parsedAtt };
       } else {
-        // Single recipient mode (forward secrecy)
-        const { ciphertext, iv, contentSalt, version } = await response.json();
-        // Reconstruct the DEK using forward secrecy (master secret + version)
-        const masterSecret = await getMasterSecret();
-        const salt = `secured-gossip-v${version}`;
-        const dek = await hkdf(salt, masterSecret, "paste", 32);
-        const key = await crypto.subtle.importKey(
-          'raw',
-          dek,
-          { name: 'AES-GCM' },
-          true,
-          ['decrypt']
+        decryptedResult = await decryptContent(
+          resData.ciphertext,
+          resData.iv,
+          metaInfo.fragmentKey,
+          resData.attachmentCiphertext,
+          resData.attachmentIv
         );
-        decrypted = await decrypt(key, ciphertext, iv);
       }
 
-      setPlaintext(decrypted);
+      setPlaintext(decryptedResult.plaintext);
+
+      if (decryptedResult.attachment) {
+        const blob = new Blob([decryptedResult.attachment.buffer], {
+          type: decryptedResult.attachment.mimetype || 'application/octet-stream'
+        });
+        const url = URL.createObjectURL(blob);
+        setAttachment({ filename: decryptedResult.attachment.filename, url });
+      } else {
+        setAttachment(null);
+      }
+
       setStatus('success');
-      setPinInput(''); // Clear PIN immediately
-      setRecipientId(''); // Clear recipient ID
-      setPassphrase(''); // Clear passphrase
+      setPinInput('');
+      setRecipientId('');
+      setPassphrase('');
     } catch (err) {
       console.error('Decryption error:', err);
       setStatus('error');
@@ -206,75 +241,92 @@ function ViewSecret() {
   }
 
   return (
-    <main>
-      <h1>Secured_Gossip</h1>
-      
-      {status === 'loading_meta' && <p>Checking secret status...</p>}
-      
-      {status === 'ready' && (
-        <form onSubmit={handleReveal}>
-          <p>A secret has been shared with you.</p>
-          {metaInfo.isMulti ? (
-            <>
-              <div style={{ margin: '1rem 0' }}>
-                <label>
-                  Recipient ID:{' '}
-                  <input
-                    value={recipientId}
-                    onChange={e => setRecipientId(e.target.value)}
-                    required
-                  />
-                </label>
-              </div>
-              <div style={{ margin: '1rem 0' }}>
-                <label>
-                  Passphrase:{' '}
-                  <input
-                    type="password"
-                    value={passphrase}
-                    onChange={e => setPassphrase(e.target.value)}
-                    required
-                  />
-                </label>
-              </div>
-            </>
-          ) : (
-            <>
-              {metaInfo.hasPin && (
-                <div style={{ margin: '1rem 0' }}>
-                  <label>
-                    PIN Required:{' '}
+    <div className="page-shell page-shell-view">
+      <header className="page-header"><span className="wordmark">Secured_Gossip</span></header>
+
+      <main className="view-center">
+        <WaveField className="view-wave" />
+        <div className="panel view-card">
+          {status === 'loading_meta' && <p className="muted-text">Checking secret status…</p>}
+
+          {status === 'ready' && (
+            <form onSubmit={handleReveal} className="reveal-form">
+              <SealMark />
+              <p className="view-lead">Someone trusted you with a secret.</p>
+              <p className="view-sub">This message is encrypted and waiting for you.</p>
+              {metaInfo.hasAttachment && (
+                <p className="view-note">📁 This secret includes an encrypted file attachment.</p>
+              )}
+
+              {metaInfo.isMulti ? (
+                <>
+                  <div className="field">
+                    <span className="eyebrow">Recipient ID</span>
                     <input
-                      type="password"
-                      value={pinInput}
-                      onChange={e => setPinInput(e.target.value)}
+                      className="field-input"
+                      value={recipientId}
+                      onChange={e => setRecipientId(e.target.value)}
+                      placeholder="e.g. Alice"
                       required
                     />
-                  </label>
+                  </div>
+                  <div className="field">
+                    <span className="eyebrow">Passphrase</span>
+                    <input
+                      type="password"
+                      className="field-input"
+                      value={passphrase}
+                      onChange={e => setPassphrase(e.target.value)}
+                      placeholder="Enter passphrase"
+                      required
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  {metaInfo.hasPin && (
+                    <div className="field">
+                      <span className="eyebrow">PIN required</span>
+                      <input
+                        type="password"
+                        className="field-input"
+                        value={pinInput}
+                        onChange={e => setPinInput(e.target.value)}
+                        placeholder="Enter PIN"
+                        required
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+
+              <button type="submit" className="btn btn-primary-light" style={{ marginTop: '1rem' }}>
+                Reveal Secret
+              </button>
+              {errorMessage && <p className="error-text">{errorMessage}</p>}
+            </form>
+          )}
+
+          {status === 'revealing' && <p className="muted-text">Decrypting…</p>}
+          {status === 'error' && <p className="error-text">{errorMessage}</p>}
+
+          {status === 'success' && (
+            <div className="reveal-success">
+              <p className="view-lead">Secret unlocked</p>
+              {plaintext && <pre className="secret-text">{plaintext}</pre>}
+              {attachment && (
+                <div className="attachment-card" style={{ marginTop: '1rem' }}>
+                  <span className="attachment-name">{attachment.filename}</span>
+                  <a href={attachment.url} download={attachment.filename} className="btn btn-secondary-light">
+                    Download File
+                  </a>
                 </div>
               )}
-            </>
+            </div>
           )}
-          <button type="submit">Reveal Secret</button>
-        </form>
-      )}
-
-      {status === 'revealing' && <p>Decrypting...</p>}
-      
-      {status === 'error' && (
-        <p style={{ color: 'red' }}>{errorMessage}</p>
-      )}
-      
-      {errorMessage && status === 'ready' && (
-        <p style={{ color: 'red' }}>{errorMessage}</p>
-      )}
-      
-      {status === 'success' && (
-        <pre style={{ whiteSpace: 'pre-wrap', textAlign: 'left', padding: '1rem', border: '1px solid #ccc' }}>
-          {plaintext}
-        </pre>
-      )}
-    </main>
+        </div>
+      </main>
+    </div>
   );
 }
 
